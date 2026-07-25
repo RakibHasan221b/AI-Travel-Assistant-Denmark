@@ -1,0 +1,35 @@
+[project]
+name = "ai-denmark-explorer"
+version = "0.1.0"
+description = "AI-powered place discovery for Copenhagen — pilot phase of AI Denmark Explorer"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit",
+    "requests",
+    "python-dotenv",
+    "sqlalchemy",
+    "psycopg[binary]",
+    "pandas",
+]
+
+[project.optional-dependencies]
+# Phase 4 — Reddit signal pipeline
+reddit = ["playwright", "flashtext", "geonamescache", "pycountry"]
+# Phase 5 — ML/LLM distillation loop
+distillation = ["scikit-learn"]
+# Phase 6 — embeddings + pgvector semantic search
+embeddings = ["sentence-transformers", "pgvector"]
+# Phase 8 — RAG
+rag = ["langchain", "langchain-openai", "langchain-groq"]
+# Phase 9 — quality-score model bake-off
+modeling = ["scikit-learn", "xgboost", "optuna", "torch", "mlflow"]
+# Phase 11 — agent + thin API
+agent = ["crewai", "langchain", "fastapi", "uvicorn"]
+dev = ["pytest", "ruff"]
+
+[tool.ruff]
+line-length = 100
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
