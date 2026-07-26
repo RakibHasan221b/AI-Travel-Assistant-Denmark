@@ -19,7 +19,7 @@ for the semantic search phase ahead.
 | 4 | Reddit signal pipeline (optional) | tabled — Reddit now requires Devvit developer registration + pre-approval, not just a quick form; revisit later, never blocking |
 | 5 | ML→LLM→ML distillation loop | not started |
 | 6 | pgvector semantic search | done — 1,468 places + 553 reviews embedded, verified with combined category+neighborhood+semantic queries |
-| 7 | Unsupervised clustering | not started |
+| 7 | Unsupervised clustering | done — 18 named clusters (silhouette-picked k), e.g. "Sushi Restaurants," "Vesterbro cafes" |
 | 8 | RAG-grounded summaries | not started |
 | 9 | Quality-score model bake-off | not started |
 | 10 | Weather-aware time series | not started |
