@@ -16,9 +16,9 @@ for the semantic search phase ahead.
 | 1 | OSM place data backbone | done — 1,468 places loaded |
 | 2 | ~~Seed reviews~~ | dropped, not required |
 | 3 | Wikivoyage descriptions | done — 553 parsed, 191 linked to places |
-| 4 | Reddit signal pipeline (optional) | not started |
+| 4 | Reddit signal pipeline (optional) | tabled — Reddit now requires Devvit developer registration + pre-approval, not just a quick form; revisit later, never blocking |
 | 5 | ML→LLM→ML distillation loop | not started |
-| 6 | pgvector semantic search | not started |
+| 6 | pgvector semantic search | done — 1,468 places + 553 reviews embedded, verified with combined category+neighborhood+semantic queries |
 | 7 | Unsupervised clustering | not started |
 | 8 | RAG-grounded summaries | not started |
 | 9 | Quality-score model bake-off | not started |
