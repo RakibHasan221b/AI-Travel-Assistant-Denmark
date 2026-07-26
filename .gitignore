@@ -8,6 +8,8 @@ venv/
 *.faiss
 *.index
 artifacts/
+mlruns/
+mlflow.db
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
