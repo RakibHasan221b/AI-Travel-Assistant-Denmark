@@ -20,7 +20,9 @@ distillation = ["scikit-learn"]
 # Phase 6 — embeddings + pgvector semantic search
 embeddings = ["sentence-transformers", "pgvector"]
 # Phase 8 — RAG
-rag = ["langchain", "langchain-openai", "langchain-groq"]
+# langchain-openai pinned <0.4: the latest release pulls langchain-core>=1.0,
+# which conflicts with langchain 0.3.x's own langchain-core<1.0 requirement.
+rag = ["langchain", "langchain-openai<0.4", "langchain-groq"]
 # Phase 9 — quality-score model bake-off
 modeling = ["scikit-learn", "xgboost", "optuna", "torch", "mlflow"]
 # Phase 11 — agent + thin API

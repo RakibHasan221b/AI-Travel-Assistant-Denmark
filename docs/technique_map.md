@@ -13,8 +13,8 @@ implements the technique for real, not just an import.
 | Vectorization/embeddings | 5, 6 | TF-IDF for distillation; sentence-transformer embeddings for pgvector | done (Phase 6 half) — `pipeline/embeddings/embed_places.py` |
 | pgvector semantic search | 6 | Semantic search + structured filtering in one SQL query, RAG retrieval backbone | done — `pipeline/embeddings/semantic_search.py`, verified with combined category+neighborhood+semantic queries |
 | Unsupervised learning | 7 | Clustering into vibe collections | done — `pipeline/clustering/cluster_places.py`, 18 clusters, verified coherent (e.g. Sushi Restaurants cluster is 100% actual sushi places) |
-| RAG | 8 | Grounded AI summaries with cited sources | not started |
-| LangChain | 8 | RAG chain orchestration | not started |
+| RAG | 8 | Grounded AI summaries with cited sources | done — `pipeline/rag/generate_summaries.py`, 175 places summarized, retrieval scoped per-place (never borrows another place's text), prompt explicitly flags thin evidence instead of writing confidently anyway |
+| LangChain | 8 | RAG chain orchestration | done — `ChatPromptTemplate \| ChatOpenAI` chain in `pipeline/rag/generate_summaries.py` |
 | XGBoost | 9 | Quality-score regression, tuned | done — winner, MSE 100.86, `pipeline/modeling/train_quality_model.py` |
 | Random Forest | 9 (also 5) | Quality-score regression; distillation classifier option | done — MSE 104.11, lost to XGBoost narrowly |
 | Neural networks | 9 | Small net in the quality-score bake-off | done — MLPRegressor, MSE 154.08, clearly lost on this data size (the intended "know when not to reach for DL" result) |
