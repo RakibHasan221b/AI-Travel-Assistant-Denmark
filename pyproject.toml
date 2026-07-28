@@ -26,7 +26,18 @@ rag = ["langchain", "langchain-openai<0.4", "langchain-groq"]
 # Phase 9 — quality-score model bake-off
 modeling = ["scikit-learn", "xgboost", "optuna", "torch", "mlflow"]
 # Phase 11 — agent + thin API
-agent = ["crewai", "langchain", "fastapi", "uvicorn"]
+# crewai pulls in langchain-core>=1.0, which conflicts with the pinned
+# langchain 0.3.x / langchain-openai<0.4 used elsewhere in this project.
+# Install this extra in its own virtualenv (see README setup), not into an
+# environment shared with other projects — a global install of crewai here
+# previously broke fastapi/starlette, mcp, and streamlit compatibility for
+# unrelated projects on the same machine.
+# litellm: crewai's native LLM providers don't include Groq directly; Groq
+# only works via litellm's "groq/<model>" fallback path.
+# langchain-groq is NOT needed here — crewai 1.x's Agent.tools/llm fields are
+# typed to crewai's own BaseTool/BaseLLM, not LangChain's, so Phase 11 doesn't
+# use LangChain at all (see agent/tools.py's docstring).
+agent = ["crewai", "litellm", "fastapi", "uvicorn"]
 dev = ["pytest", "ruff"]
 
 [tool.ruff]
@@ -35,3 +46,12 @@ line-length = 100
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# This project has no importable package of its own — every script manages
+# its own sys.path for cross-imports (see e.g. pipeline/rag/generate_summaries.py)
+# rather than being imported as `ai_denmark_explorer.something`. Without this,
+# setuptools' automatic package discovery finds db/, app/, pipeline/, etc. as
+# ambiguous top-level packages and refuses to build `pip install -e .` at all
+# — which means the CI workflow's own install step would fail outright.
+packages = []

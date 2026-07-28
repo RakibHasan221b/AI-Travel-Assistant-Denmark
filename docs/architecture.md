@@ -53,7 +53,25 @@ OSM, Wikivoyage, opendata.dk, and the seed review set.
 The Phase 11 trip planner is naturally three distinct jobs — finding places,
 checking timing/conditions, and synthesizing a recommendation — so it's built
 as a CrewAI crew (Place Scout, Conditions Analyst, Concierge) rather than one
-tool-calling loop. CrewAI runs on LangChain under the hood for LLM/tool
-integration, so the SQL/FAISS/weather/quality-score tools are still
-LangChain-wrapped — this doesn't drop LangChain, it adds real multi-agent
-collaboration on top of it.
+tool-calling loop.
+
+Correction to the original plan: this doc originally said CrewAI's tools
+would be LangChain-wrapped, on the assumption that CrewAI ran on LangChain
+under the hood. Once Phase 11 was actually built against the installed
+package (crewai 1.15.8), that turned out to be wrong — `Agent.tools` and
+`Agent.llm` are typed to CrewAI's own `BaseTool`/`BaseLLM`, not LangChain's,
+confirmed by inspecting the installed package rather than assumed. The four
+tools (`agent/tools.py`) are built with `crewai.tools.tool`, and the LLM
+(Groq) goes through CrewAI's own `LLM` class via litellm, not
+`langchain-groq`. LangChain's one real, verified use in this project remains
+Phase 8's RAG chain — Phase 11 doesn't use it at all.
+
+Two real bugs were hit and worked around getting the Groq-backed crew
+working, both documented inline in `agent/crew.py`: crewai 1.15.8 tags every
+LLM message with an Anthropic-specific prompt-caching marker that's never
+actually stripped for other providers (a genuine gap in the installed
+package, confirmed by grepping its source — patched with a no-op monkeypatch
+of `mark_cache_breakpoint`), and `llama-3.3-70b-versatile`'s free-tier Groq
+rate limit (12,000 TPM) sits close enough to a full 3-agent run's token
+usage that occasional rate-limit hits are expected, not exceptional — handled
+with a bounded retry in `plan_trip()` rather than pretending it won't happen.

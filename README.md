@@ -23,7 +23,7 @@ for the semantic search phase ahead.
 | 8 | RAG-grounded summaries | done — 175 places summarized via pgvector retrieval + GPT-4o (LangChain), total cost $0.227, sources cited per summary |
 | 9 | Quality-score model bake-off | done — XGBoost won (MSE 100.9) vs RF/Linear/NN, Optuna-tuned, MLflow-tracked, scores stored for all 1,468 places |
 | 10 | Weather-aware time series | done — real Open-Meteo weather + confirmed Copenhagen event dates, chronological split (MSE 17.06, MAE 2.35), 10,276 place-day forecasts |
-| 11 | CrewAI trip-planning crew + API | not started |
+| 11 | CrewAI trip-planning crew + API | done — Place Scout / Conditions Analyst / Concierge (Groq llama-3.3-70b), thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
 | 12 | Deployment | not started |
 | 13 | Portfolio write-up | not started |
 | 14 | React/TS/Vercel frontend (optional) | not started, deprioritized |
@@ -38,6 +38,28 @@ cp .env.example .env     # fill in DATABASE_URL, GROQ_API_KEY
 psql $DATABASE_URL -f db/schema.sql
 pytest
 ```
+
+### Phase 11's `agent` extra: use a short-path venv on Windows
+
+`pip install -e ".[dev,embeddings,rag,agent]"` pulls in `crewai`, which
+depends on `torch` — and torch's own bundled license files are nested deep
+enough that combined with a long project path (e.g. this repo's, under
+`...\CLAUDE PROJECTS\ai-denmark-explorer\.venv\...`), the install can hit
+Windows' 260-character path limit. If that happens, create the venv at a
+short path outside the project instead, e.g.:
+
+```bash
+python -m venv C:\Users\<you>\.venvs\ade
+C:\Users\<you>\.venvs\ade\Scripts\python.exe -m pip install -e ".[dev,embeddings,rag,agent]"
+```
+
+Also install this extra in its own venv, not one shared with other
+projects — `crewai` requires `langchain-core>=1.0`, which conflicts with the
+`langchain 0.3.x` pin used for Phase 8's `rag` extra elsewhere on the same
+machine.
+
+Run the API: `uvicorn api.main:app --port 8000`, then
+`POST /trip-plan {"request": "...", "target_date": "YYYY-MM-DD"}`.
 
 ## Data sources
 

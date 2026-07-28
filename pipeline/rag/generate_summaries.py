@@ -26,7 +26,7 @@ from sentence_transformers import SentenceTransformer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "llm"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "llm" / "prompts"))
-from rag_summary import RAG_SUMMARY_PROMPT  # noqa: E402
+from rag_summary import RAG_SUMMARY_PROMPT
 
 load_dotenv()
 

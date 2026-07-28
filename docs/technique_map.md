@@ -21,5 +21,5 @@ implements the technique for real, not just an import.
 | Hyperparameter tuning | 9 | Optuna tuning XGBoost/Random Forest | done — 25 trials each, 3-fold CV |
 | MSE / MAE | 9, 10 | Regression and forecast evaluation | done — Phase 9 (4-model bake-off) and Phase 10 (chronological forecast eval) |
 | Time series | 10 | Weather-driven visit forecasting, chronological train/test split | done — `pipeline/timeseries/forecast_interest.py`, MSE 17.06/MAE 2.35, real Open-Meteo weather + confirmed Copenhagen event dates |
-| CrewAI multi-agent crew | 11 | Trip-planning capstone — Place Scout, Conditions Analyst, and Concierge agents collaborate, each using LangChain-wrapped tools (SQL, pgvector, weather, quality-score) | not started |
+| CrewAI multi-agent crew | 11 | Trip-planning capstone — Place Scout, Conditions Analyst, and Concierge agents collaborate, each using crewai-native tools (SQL, pgvector, weather, quality-score) over Groq | done — `agent/crew.py`, `agent/tools.py`, `api/main.py`, verified live end-to-end via a real `POST /trip-plan` HTTP request |
 | React / TypeScript / Node.js (optional) | 14 | Next.js frontend as an alternative client for the Phase 11 FastAPI service — deployed on Vercel; bolt-on, not required for the core pipeline | not started |

@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline" / "llm" / "prompts"))
-from rag_summary import RAG_SUMMARY_PROMPT  # noqa: E402
+from rag_summary import RAG_SUMMARY_PROMPT
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
 
