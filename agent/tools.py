@@ -146,9 +146,10 @@ def place_details(place_name: str) -> str:
             LEFT JOIN place_clusters pc ON pc.place_id = p.place_id
             LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
             WHERE p.name ILIKE %(name)s
+            ORDER BY (lower(p.name) = lower(%(exact)s)) DESC
             LIMIT 1;
             """,
-            {"name": f"%{place_name}%"},
+            {"name": f"%{place_name}%", "exact": place_name},
         )
         row = cur.fetchone()
         if not row:
