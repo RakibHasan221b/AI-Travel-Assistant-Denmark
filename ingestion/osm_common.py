@@ -6,7 +6,7 @@ is defined.
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import psycopg
 
@@ -18,11 +18,23 @@ log = logging.getLogger("osm_common")
 BBOX = (55.66, 12.52, 55.71, 12.60)
 
 # OSM tag -> (category, subcategory) — subcategory is overridden for restaurants (cuisine)
+# "landmark" was originally tourism=attraction only, which silently dropped
+# Copenhagen's most famous landmark: the Little Mermaid statue is tagged
+# tourism=artwork, not tourism=attraction (confirmed via a live Nominatim
+# lookup, not assumed) — found when a user tried searching for it and got
+# nothing back. Widened to the OSM tags that actually cover statues,
+# monuments, and museums, not just the generic "attraction" catch-all.
 TAG_TO_CATEGORY = {
     ("amenity", "restaurant"): ("restaurant", None),
     ("amenity", "cafe"): ("cafe", None),
     ("tourism", "hotel"): ("hotel", None),
     ("tourism", "attraction"): ("landmark", None),
+    ("tourism", "artwork"): ("landmark", None),
+    ("tourism", "museum"): ("landmark", None),
+    ("tourism", "viewpoint"): ("landmark", None),
+    ("historic", "monument"): ("landmark", None),
+    ("historic", "memorial"): ("landmark", None),
+    ("historic", "castle"): ("landmark", None),
 }
 
 
@@ -104,7 +116,7 @@ def upsert(rows: list[dict], db_url: str, stage: str) -> tuple[int, int]:
                 else:
                     updated += 1
 
-            run_id = f"cph-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+            run_id = f"cph-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
             cur.execute(
                 """
                 INSERT INTO pipeline_runs (run_id, stage, completed_at, status, records_processed, notes)

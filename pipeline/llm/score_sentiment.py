@@ -18,8 +18,8 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "prompts"))
-from groq_client import GroqError, call_groq  # noqa: E402
-from aspect_sentiment_few_shot import ASPECT_SENTIMENT_PROMPT  # noqa: E402
+from aspect_sentiment_few_shot import ASPECT_SENTIMENT_PROMPT
+from groq_client import GroqError, call_groq
 
 load_dotenv()
 

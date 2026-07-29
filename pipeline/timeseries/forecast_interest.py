@@ -15,7 +15,8 @@ information into training.
 
 import logging
 import os
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,8 @@ import psycopg
 from dotenv import load_dotenv
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
+
+TZ = ZoneInfo("Europe/Copenhagen")
 
 load_dotenv()
 
@@ -104,7 +107,7 @@ def main():
     with psycopg.connect(db_url, connect_timeout=15) as conn:
         weather = load_weather(conn)
 
-    today = date.today()
+    today = datetime.now(TZ).date()
     historical = weather[weather["date"] < today]
     forecast_days = weather[weather["date"] >= today]
     log.info(f"{len(historical)} historical days, {len(forecast_days)} forecast days")

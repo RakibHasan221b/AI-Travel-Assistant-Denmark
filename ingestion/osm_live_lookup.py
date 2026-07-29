@@ -22,8 +22,7 @@ import time
 
 import requests
 from dotenv import load_dotenv
-
-from osm_common import classify, to_row, upsert
+from osm_common import to_row, upsert
 
 load_dotenv()
 

@@ -22,8 +22,8 @@ from sklearn.metrics import silhouette_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "llm"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "llm" / "prompts"))
-from groq_client import GroqError, call_groq  # noqa: E402
-from cluster_naming_few_shot import CLUSTER_NAMING_PROMPT  # noqa: E402
+from cluster_naming_few_shot import CLUSTER_NAMING_PROMPT
+from groq_client import GroqError, call_groq
 
 load_dotenv()
 

@@ -68,7 +68,7 @@ def get_district_articles() -> list[str]:
     data = api_get(
         {"action": "query", "titles": MAIN_ARTICLE, "prop": "links", "plnamespace": 0, "pllimit": 500}
     )
-    page = list(data["query"]["pages"].values())[0]
+    page = next(iter(data["query"]["pages"].values()))
     titles = [l["title"] for l in page.get("links", [])]
     return [t for t in titles if t.startswith(f"{MAIN_ARTICLE}/")]
 
@@ -81,7 +81,7 @@ def get_wikitext(title: str) -> str:
     data = api_get(
         {"action": "query", "titles": title, "prop": "revisions", "rvprop": "content", "rvslots": "main"}
     )
-    page = list(data["query"]["pages"].values())[0]
+    page = next(iter(data["query"]["pages"].values()))
     revisions = page.get("revisions")
     text = revisions[0]["slots"]["main"]["*"] if revisions else ""
 
@@ -161,13 +161,12 @@ def match_place(listing: dict, places: list[dict]) -> tuple[str, str, float] | N
 
 def main():
     db_url = os.environ["DATABASE_URL"]
-    with psycopg.connect(db_url, connect_timeout=15) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT place_id::text, name, lat, lon, category FROM places;")
-            places = [
-                {"place_id": r[0], "name": r[1], "lat": r[2], "lon": r[3], "category": r[4]}
-                for r in cur.fetchall()
-            ]
+    with psycopg.connect(db_url, connect_timeout=15) as conn, conn.cursor() as cur:
+        cur.execute("SELECT place_id::text, name, lat, lon, category FROM places;")
+        places = [
+            {"place_id": r[0], "name": r[1], "lat": r[2], "lon": r[3], "category": r[4]}
+            for r in cur.fetchall()
+        ]
     log.info(f"Loaded {len(places)} places for matching")
 
     districts = get_district_articles()
@@ -191,10 +190,24 @@ def main():
 
     log.info(f"Total listings parsed: {len(all_listings)}")
 
-    linked = unlinked = 0
+    linked = unlinked = skipped = 0
     with psycopg.connect(db_url, connect_timeout=15) as conn:
         with conn.cursor() as cur:
+            # Idempotency guard: this script has no natural DB constraint to
+            # rely on (unlike osm_common.py's ON CONFLICT (osm_id) or
+            # weather.py's ON CONFLICT (date)), so re-running it against the
+            # same cached articles would otherwise insert duplicate
+            # reviews_raw rows every time — (source_id, source_url) is the
+            # natural key for one Wikivoyage listing.
+            cur.execute("SELECT source_id, source_url FROM reviews_raw WHERE source_type = 'wikivoyage';")
+            existing = {(row[0], row[1]) for row in cur.fetchall()}
+
             for listing in all_listings:
+                source_url = f"https://en.wikivoyage.org/wiki/{listing['source_title'].replace(' ', '_')}"
+                if (listing["name"], source_url) in existing:
+                    skipped += 1
+                    continue
+
                 match = match_place(listing, places)
                 place_id = match[0] if match else None
                 cur.execute(
@@ -207,7 +220,7 @@ def main():
                     (
                         place_id,
                         listing["name"],
-                        f"https://en.wikivoyage.org/wiki/{listing['source_title'].replace(' ', '_')}",
+                        source_url,
                         listing["content"],
                         "wikivoyage-initial-load",
                         psycopg.types.json.Json(listing),
@@ -227,6 +240,7 @@ def main():
                 else:
                     unlinked += 1
         conn.commit()
+    log.info(f"Skipped {skipped} already-ingested listings.")
 
     log.info(f"Done. {linked} listings linked to places, {unlinked} stored unlinked.")
 

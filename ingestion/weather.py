@@ -6,7 +6,8 @@ chronological train/test split later.
 
 import logging
 import os
-from datetime import date, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import psycopg
 import requests
@@ -18,6 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("weather")
 
 LAT, LON = 55.6761, 12.5683  # Copenhagen city center
+TZ = ZoneInfo("Europe/Copenhagen")
 HISTORY_START = "2025-01-01"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -61,7 +63,7 @@ def upsert_days(conn, daily: dict):
 
 def main():
     db_url = os.environ["DATABASE_URL"]
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
 
     with psycopg.connect(db_url, connect_timeout=15) as conn:
         log.info(f"Fetching historical weather {HISTORY_START} to {yesterday}...")

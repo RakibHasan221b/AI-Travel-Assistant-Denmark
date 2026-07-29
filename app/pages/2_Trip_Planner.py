@@ -33,6 +33,14 @@ with st.form("trip_form"):
         placeholder="I want a cozy quiet cafe to work from and one landmark to visit nearby, I like calm places",
         height=100,
     )
+    # Explicit field, not left to the LLM to parse out of free text — the
+    # underlying search_places/top_quality_places tools already take a
+    # neighborhood filter, this just makes it a reliable, visible input
+    # instead of something you have to know to type inline.
+    area = st.selectbox(
+        "Area in Copenhagen (optional)",
+        ["Any area", "Vesterbro", "Norrebro", "Osterbro", "Frederiksberg", "Indre By"],
+    )
     target_date = st.date_input("Target date", value=COPENHAGEN_TODAY + timedelta(days=1))
     submitted = st.form_submit_button("Plan my trip", type="primary")
 
@@ -40,11 +48,12 @@ if submitted:
     if not request_text.strip():
         st.warning("Describe what you're looking for first.")
     else:
+        full_request = request_text if area == "Any area" else f"In {area}: {request_text}"
         with st.spinner("Planning your trip — this runs three real agents and real tool calls, usually 1-2 minutes..."):
             try:
                 resp = requests.post(
                     f"{get_api_url()}/trip-plan",
-                    json={"request": request_text, "target_date": target_date.isoformat()},
+                    json={"request": full_request, "target_date": target_date.isoformat()},
                     timeout=180,
                 )
                 resp.raise_for_status()

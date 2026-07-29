@@ -20,7 +20,6 @@ from pathlib import Path
 import osmium
 import requests
 from dotenv import load_dotenv
-
 from osm_common import BBOX, in_bbox, to_row, upsert
 
 load_dotenv()
@@ -40,7 +39,7 @@ def download_extract() -> Path:
         return CACHE_PATH
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    log.info(f"Downloading Denmark extract from Geofabrik (one-time, cached after)...")
+    log.info("Downloading Denmark extract from Geofabrik (one-time, cached after)...")
     with requests.get(GEOFABRIK_URL, stream=True, timeout=300) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0))
