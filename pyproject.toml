@@ -44,7 +44,12 @@ modeling = ["scikit-learn", "xgboost", "optuna", "torch", "mlflow"]
 # langchain-groq is NOT needed here — crewai 1.x's Agent.tools/llm fields are
 # typed to crewai's own BaseTool/BaseLLM, not LangChain's, so Phase 11 doesn't
 # use LangChain at all (see agent/tools.py's docstring).
-agent = ["crewai", "litellm", "fastapi", "uvicorn"]
+# Self-references the embeddings extra: agent/tools.py's search_places tool
+# does real pgvector semantic search (Phase 6), so this extra needs
+# sentence-transformers + pgvector too — a real gap only surfaced when
+# Render's build ran `pip install -e ".[agent]"` in isolation, unlike local
+# dev/CI which always install every extra together and masked it.
+agent = ["crewai", "litellm", "fastapi", "uvicorn", "ai-denmark-explorer[embeddings]"]
 dev = ["pytest", "ruff"]
 
 [tool.ruff]
