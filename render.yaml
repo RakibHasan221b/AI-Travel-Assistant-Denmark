@@ -20,3 +20,9 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      # Pinned to match pyproject.toml's requires-python and CI's runtime —
+      # without this, Render defaults to a newer Python with no prebuilt
+      # tiktoken wheel, forcing a from-source Rust build that fails outright
+      # (Render's build sandbox has a read-only Cargo cache directory).
+      - key: PYTHON_VERSION
+        value: "3.11.9"
