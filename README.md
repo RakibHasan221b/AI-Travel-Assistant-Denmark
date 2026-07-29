@@ -24,9 +24,11 @@ for the semantic search phase ahead.
 | 9 | Quality-score model bake-off | done — XGBoost won (MSE 100.9) vs RF/Linear/NN, Optuna-tuned, MLflow-tracked, scores stored for all 1,468 places |
 | 10 | Weather-aware time series | done — real Open-Meteo weather + confirmed Copenhagen event dates, chronological split (MSE 17.06, MAE 2.35), 10,276 place-day forecasts |
 | 11 | CrewAI trip-planning crew + API | done — Place Scout / Conditions Analyst / Concierge (Groq llama-3.3-70b), thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
-| 12 | Deployment | app built (3 pages: Explore, Trip Planner, Stats Dashboard) and verified locally end-to-end with real data; deployment configs ready (`render.yaml`, `docs/deployment.md`) — actual cloud deploy needs your own Render/Streamlit Cloud account, see `docs/deployment.md` |
-| 13 | Portfolio write-up | not started |
+| 12 | Deployment | **live** — API on Render (`https://ai-denmark-explorer-api.onrender.com`), app on Streamlit Community Cloud. Three real bugs hit and fixed getting here (Python version, a missing dependency, an out-of-memory kill) — full story in `docs/deployment_troubleshooting.md` |
+| 13 | Portfolio write-up | not started — natural next step now that Phase 12 is actually live |
 | 14 | React/TS/Vercel frontend (optional) | not started, deprioritized |
+
+**Bolt-on additions (not tied to the original phase numbering):** data validation on OSM ingestion, an A/B-testing framework for RAG-summary prompts (run live: a=3, b=2, tie=5), and web-search enrichment for places with thin/no data (fixed a real bug live — the Little Mermaid statue went from search rank 701/1,896 to rank 1). See `docs/technique_map.md` for full details on each.
 
 ## Setup
 
