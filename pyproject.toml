@@ -44,12 +44,18 @@ modeling = ["scikit-learn", "xgboost", "optuna", "torch", "mlflow"]
 # langchain-groq is NOT needed here — crewai 1.x's Agent.tools/llm fields are
 # typed to crewai's own BaseTool/BaseLLM, not LangChain's, so Phase 11 doesn't
 # use LangChain at all (see agent/tools.py's docstring).
-# Self-references the embeddings extra: agent/tools.py's search_places tool
-# does real pgvector semantic search (Phase 6), so this extra needs
-# sentence-transformers + pgvector too — a real gap only surfaced when
+# agent/tools.py's search_places tool does real pgvector semantic search
+# (Phase 6), so this extra needs pgvector too — a real gap only surfaced when
 # Render's build ran `pip install -e ".[agent]"` in isolation, unlike local
 # dev/CI which always install every extra together and masked it.
-agent = ["crewai", "litellm", "fastapi", "uvicorn", "ai-denmark-explorer[embeddings]"]
+# fastembed, not sentence-transformers: crewai itself doesn't need torch,
+# but sentence-transformers does, and torch pushed this service's memory
+# past Render's free-tier 512MB limit (deploy was getting OOM-killed).
+# fastembed (ONNX Runtime — already a crewai transitive dep via chromadb)
+# produces effectively identical vectors for the same all-MiniLM-L6-v2
+# weights (cosine similarity 1.0000, verified before switching) — no torch
+# import at all. See agent/tools.py's module docstring for the full story.
+agent = ["crewai", "litellm", "fastapi", "uvicorn", "pgvector", "fastembed"]
 dev = ["pytest", "ruff"]
 
 [tool.ruff]

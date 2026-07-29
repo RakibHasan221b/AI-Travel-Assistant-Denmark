@@ -15,6 +15,18 @@ Each tool opens its own short-lived DB connection, matching every other
 script in this project — fine at this project's demo scale (a handful of
 tool calls per trip-plan request), not meant to survive real production
 request volume.
+
+Query embedding uses fastembed (ONNX Runtime), not sentence-transformers —
+crewai itself doesn't need torch (confirmed: `import crewai` alone never
+touches sys.modules for torch/transformers), but sentence-transformers does,
+and torch pushed this service's memory past Render's free-tier 512MB limit
+(deploy was getting OOM-killed, exit 137). fastembed's ONNX export of the
+same all-MiniLM-L6-v2 weights produces effectively identical vectors
+(cosine similarity 1.0000 against sentence-transformers' output, verified
+before switching) — same embedding space as what Phase 6's batch ingestion
+script already wrote to the DB, just a lighter runtime for the live API.
+That batch script keeps using sentence-transformers; it runs locally, not
+on Render, so its memory footprint was never the problem.
 """
 
 import os
@@ -23,19 +35,19 @@ from datetime import datetime
 import psycopg
 from crewai.tools import tool
 from dotenv import load_dotenv
+from fastembed import TextEmbedding
 from pgvector.psycopg import register_vector
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-_embed_model: SentenceTransformer | None = None
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+_embed_model: TextEmbedding | None = None
 
 
-def _get_embed_model() -> SentenceTransformer:
+def _get_embed_model() -> TextEmbedding:
     global _embed_model
     if _embed_model is None:
-        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+        _embed_model = TextEmbedding(model_name=EMBED_MODEL_NAME)
     return _embed_model
 
 
@@ -52,7 +64,7 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
     good for working". Optionally filter by category (restaurant, cafe,
     hotel, landmark, bar) and/or neighborhood."""
     model = _get_embed_model()
-    query_embedding = model.encode(query)
+    query_embedding = next(model.embed([query]))
     sql = """
         SELECT name, category, neighborhood, opening_hours,
                1 - (embedding <=> %(qvec)s) AS similarity
