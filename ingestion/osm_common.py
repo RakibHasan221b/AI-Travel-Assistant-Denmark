@@ -9,13 +9,13 @@ import logging
 from datetime import UTC, datetime
 
 import psycopg
+from geo import (  # noqa: F401 — re-exported, other modules import BBOX/in_bbox from here
+    BBOX,
+    in_bbox,
+)
+from validation import validate_row
 
 log = logging.getLogger("osm_common")
-
-# Central Copenhagen pilot area (Indre By, Vesterbro, Norrebro, Frederiksberg core) —
-# south, west, north, east. Narrower than the full municipality on purpose; widen
-# once there's a reason to (the bulk path can easily cover more once this works).
-BBOX = (55.66, 12.52, 55.71, 12.60)
 
 # OSM tag -> (category, subcategory) — subcategory is overridden for restaurants (cuisine)
 # "landmark" was originally tourism=attraction only, which silently dropped
@@ -36,11 +36,6 @@ TAG_TO_CATEGORY = {
     ("historic", "memorial"): ("landmark", None),
     ("historic", "castle"): ("landmark", None),
 }
-
-
-def in_bbox(lat: float, lon: float) -> bool:
-    s, w, n, e = BBOX
-    return s <= lat <= n and w <= lon <= e
 
 
 def classify(tags: dict):
@@ -69,7 +64,7 @@ def to_row(osm_type: str, osm_id: int, tags: dict, lat: float, lon: float) -> di
     category, subcategory = classification
     if category == "restaurant":
         subcategory = tags.get("cuisine")
-    return {
+    row = {
         "osm_id": f"{osm_type}/{osm_id}",
         "name": name,
         "category": category,
@@ -81,6 +76,7 @@ def to_row(osm_type: str, osm_id: int, tags: dict, lat: float, lon: float) -> di
         "opening_hours": tags.get("opening_hours"),
         "osm_tags": json.dumps(dict(tags)),
     }
+    return validate_row(row)
 
 
 UPSERT_SQL = """

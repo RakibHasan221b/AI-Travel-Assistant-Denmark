@@ -151,6 +151,26 @@ CREATE TABLE place_clusters (
     PRIMARY KEY (place_id, cluster_id)
 );
 
+-- A/B test results for LLM prompt variants (e.g. Phase 8's RAG summary
+-- prompt v1 vs v2) — both variants' output land here so a winner can be
+-- picked by a deterministic score (pipeline/experiments/ab_scoring.py)
+-- instead of eyeballing outputs.
+CREATE TABLE experiment_results (
+    result_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    experiment_name text NOT NULL,          -- e.g. 'rag_summary_prompt_v1_vs_v2'
+    place_id        uuid REFERENCES places (place_id),
+    variant         text NOT NULL CHECK (variant IN ('a', 'b')),
+    output_text     text NOT NULL,
+    model_used      text NOT NULL,
+    score_json      jsonb NOT NULL,          -- ab_scoring.score_summary() output
+    winner          text CHECK (winner IN ('a', 'b', 'tie')),  -- same for both rows of a pair
+    cost_usd_est    numeric(10, 6),
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_experiment_results_name ON experiment_results (experiment_name);
+CREATE INDEX idx_experiment_results_place_id ON experiment_results (place_id);
+
 -- Idempotent, resumable pipeline run tracking
 CREATE TABLE pipeline_runs (
     run_id            text PRIMARY KEY,     -- e.g. cph-20260725-001
