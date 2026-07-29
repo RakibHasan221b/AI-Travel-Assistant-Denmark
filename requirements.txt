@@ -1,0 +1,10 @@
+# Streamlit Community Cloud reads this file from the repo root (not
+# pyproject.toml's extras) — deliberately scoped to only what app/ needs,
+# not the full pipeline/ingestion/agent dependency set.
+streamlit
+psycopg[binary]
+pgvector
+sentence-transformers
+python-dotenv
+requests
+pandas

@@ -1,0 +1,22 @@
+# Render blueprint for the Phase 11 FastAPI trip-planning service.
+# Deploy: render.com -> New -> Blueprint -> point at this repo. Render reads
+# this file automatically. DATABASE_URL and GROQ_API_KEY must be set as
+# secrets in Render's dashboard (Environment tab) — never committed here.
+#
+# Known risk, not yet verified live: the `agent` extra's dependency tree
+# (crewai -> torch/transformers/chromadb/lancedb/onnxruntime) is heavy —
+# ~1.8GB locally. Render's free tier has limited RAM/disk; this may need a
+# paid instance type, or a slow cold start on the free tier. Not something
+# that can be confirmed without an actual Render account/deploy.
+services:
+  - type: web
+    name: ai-denmark-explorer-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -e ".[agent]"
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false

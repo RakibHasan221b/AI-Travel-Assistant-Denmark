@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ade-app",
+      "runtimeExecutable": "C:\\Users\\rakib\\.venvs\\ade\\Scripts\\streamlit.exe",
+      "runtimeArgs": [
+        "run",
+        "C:\\Users\\rakib\\Desktop\\NEW desktop\\CLAUDE PROJECTS\\ai-denmark-explorer\\app\\Home.py",
+        "--server.headless",
+        "true",
+        "--server.port",
+        "8501"
+      ],
+      "port": 8501
+    }
+  ]
+}
