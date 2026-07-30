@@ -96,6 +96,36 @@ def _connect():
     return conn
 
 
+def _resolve_place(cur, place_name: str) -> tuple | None:
+    """Returns (place_id, name, lat, lon) for the best-matching place, or
+    None. Tries an exact/substring name match first (cheap, precise); falls
+    back to semantic search when that finds nothing.
+
+    The fallback is the real fix for a bug found live: the Concierge asked
+    place_details for "Little Mermaid statue" (the traveler's English
+    wording), but the DB stores this landmark under its Danish OSM name,
+    "Den lille Havfrue" — zero literal text overlap, so ILIKE found nothing
+    even though the place and its full AI summary genuinely exist. Semantic
+    search doesn't care what language/wording was used, only meaning."""
+    cur.execute(
+        "SELECT place_id, name, lat, lon FROM places WHERE name ILIKE %(name)s "
+        "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
+        {"name": f"%{place_name}%", "exact": place_name},
+    )
+    row = cur.fetchone()
+    if row:
+        return row
+
+    model = _get_embed_model()
+    query_embedding = next(model.embed([place_name]))
+    cur.execute(
+        "SELECT place_id, name, lat, lon FROM places WHERE embedding IS NOT NULL "
+        "ORDER BY embedding <=> %(qvec)s LIMIT 1;",
+        {"qvec": query_embedding},
+    )
+    return cur.fetchone()
+
+
 @tool
 def search_places(query: str, category: str = "", neighborhood: str = "", limit: int = 5) -> str:
     """Semantic search over Copenhagen places (pgvector). Use this to find
@@ -176,6 +206,11 @@ def place_details(place_name: str) -> str:
     sources. Use this before finalizing a recommendation for a specific
     place — never state a fact about a place that isn't returned here."""
     with _connect() as conn, conn.cursor() as cur:
+        resolved = _resolve_place(cur, place_name)
+        if not resolved:
+            return f"No place found matching '{place_name}'."
+        place_id = resolved[0]
+
         cur.execute(
             """
             SELECT p.place_id, p.name, p.category, p.neighborhood, p.opening_hours,
@@ -184,15 +219,12 @@ def place_details(place_name: str) -> str:
             LEFT JOIN ml_predictions m ON m.place_id = p.place_id AND m.target = 'quality_score'
             LEFT JOIN place_clusters pc ON pc.place_id = p.place_id
             LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
-            WHERE p.name ILIKE %(name)s
-            ORDER BY (lower(p.name) = lower(%(exact)s)) DESC
+            WHERE p.place_id = %s
             LIMIT 1;
             """,
-            {"name": f"%{place_name}%", "exact": place_name},
+            (place_id,),
         )
         row = cur.fetchone()
-        if not row:
-            return f"No place found matching '{place_name}'."
         columns = [d.name for d in cur.description]
         place = dict(zip(columns, row))
 
@@ -249,16 +281,12 @@ def travel_time_estimate(place_name: str) -> str:
         return "No starting location was given for this trip, so travel time can't be estimated."
 
     with _connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT lat, lon FROM places WHERE name ILIKE %(name)s "
-            "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
-            {"name": f"%{place_name}%", "exact": place_name},
-        )
-        row = cur.fetchone()
-    if not row:
+        resolved = _resolve_place(cur, place_name)
+    if not resolved:
         return f"No place found matching '{place_name}' to estimate travel time for."
+    _, _, lat, lon = resolved
 
-    dist_km = haversine_km(_trip_start["lat"], _trip_start["lon"], row[0], row[1])
+    dist_km = haversine_km(_trip_start["lat"], _trip_start["lon"], lat, lon)
     walk_min = round(dist_km / WALK_KMH * 60)
     bike_min = round(dist_km / BIKE_KMH * 60)
 

@@ -154,11 +154,18 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     scout_task = Task(
         description=(
             "Traveler request: {request}\n\n"
-            "Find 3-5 candidate Copenhagen places matching this request. Use search_places "
-            "for vibe/description matches and top_quality_places if the request is about "
-            "finding the best-rated places. List only places your tools actually returned."
+            "If the traveler named one specific place (e.g. 'the Little Mermaid', 'Torvehallerne'), "
+            "find just that place and confirm it exists — do not pad the list with unrelated extra "
+            "candidates just because a broader search surfaces them. Only if the request is genuinely "
+            "open-ended (a vibe, category, or 'best of' request, not one named place) should you find "
+            "3-5 candidates: use search_places for vibe/description matches and top_quality_places if "
+            "the request is about finding the best-rated places. List only places your tools actually "
+            "returned."
         ),
-        expected_output="A short list of candidate places with category and neighborhood.",
+        expected_output=(
+            "Either one specific place (if the traveler named one) or a short list of 3-5 candidates "
+            "(if the request was open-ended), each with category and neighborhood."
+        ),
         agent=place_scout,
     )
 
@@ -180,6 +187,14 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "recommendation for the traveler's request: {request} (target date: {target_date}). "
             "Cite the quality score and, when available, the AI summary's sources for each "
             "place you recommend. Do not recommend a place you didn't call place_details on.\n\n"
+            "If the traveler named one specific place, your entire answer should be about that "
+            "place only — do not mention, discuss, or explain why other candidates the Scout "
+            "found 'aren't recommended.' Only compare multiple places if the traveler's request "
+            "was genuinely open-ended (a vibe or category, not one named place).\n\n"
+            "You MUST include the Conditions Analyst's weather/outdoor-interest note in your "
+            "final answer, in your own words — every recommendation needs to say whether "
+            "conditions on {target_date} favor these places, not just describe the places "
+            "themselves. Do not omit this even if the rest of the answer is already long.\n\n"
             "Traveler's starting point: {start_location}\n"
             "If a starting point was given (not 'not provided'), call travel_time_estimate on "
             "each place you recommend and mention the estimated distance/travel time. If no "
@@ -188,8 +203,9 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
         ),
         expected_output=(
             "A final itinerary recommendation: 2-3 places with why each fits, their real "
-            "quality score, cited sources where available, and — only if a starting point was "
-            "given — an estimated travel time to each."
+            "quality score, cited sources where available, the weather/outdoor-interest "
+            "conditions for the target date (always included, never omitted), and — only if a "
+            "starting point was given — an estimated travel time to each."
         ),
         agent=concierge,
         context=[scout_task, conditions_task],

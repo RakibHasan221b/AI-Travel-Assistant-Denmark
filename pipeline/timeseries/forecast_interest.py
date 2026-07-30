@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import psycopg
 from dotenv import load_dotenv
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
 TZ = ZoneInfo("Europe/Copenhagen")
@@ -51,6 +51,11 @@ CATEGORIES = list(CATEGORY_WEATHER_SENSITIVITY.keys())
 
 TEST_DAYS = 30
 RANDOM_STATE = 42
+
+# Same tolerance-based "success rate" as Phase 9's quality-score model, for
+# a consistent, plain-English number across both models — see that
+# script's comment on why MAPE is skipped (not ratio data, blows up near 0).
+SUCCESS_TOLERANCE = 10
 
 
 def is_event_day(d: date) -> bool:
@@ -127,7 +132,12 @@ def main():
     pred = model.predict(test[feature_cols])
     mse = mean_squared_error(test["target"], pred)
     mae = mean_absolute_error(test["target"], pred)
-    log.info(f"Chronological held-out eval: MSE={mse:.2f}, MAE={mae:.2f}")
+    r2 = r2_score(test["target"], pred)
+    success_rate = float(np.mean(np.abs(test["target"].to_numpy() - pred) <= SUCCESS_TOLERANCE))
+    log.info(
+        f"Chronological held-out eval: RMSE={mse**0.5:.2f}, MAE={mae:.2f}, R2={r2:.2f}, "
+        f"success_rate(±{SUCCESS_TOLERANCE}pts)={success_rate:.0%}"
+    )
 
     # Retrain on all historical data for the actual forecast
     model.fit(dataset[feature_cols], dataset["target"])

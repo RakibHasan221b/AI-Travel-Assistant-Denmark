@@ -24,7 +24,7 @@ import psycopg
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
@@ -38,6 +38,12 @@ log = logging.getLogger("train_quality_model")
 
 RANDOM_STATE = 42
 N_TRIALS = 25
+
+# "Success rate": % of predictions within this many points of the true
+# score (0-100 scale) — the plain-English number for anyone who doesn't
+# want to interpret R²/RMSE. Deliberately not MAPE: these are engineered
+# composite scores, not naturally ratio data, and MAPE blows up near zero.
+SUCCESS_TOLERANCE = 10
 
 
 def load_places(conn) -> pd.DataFrame:
@@ -136,12 +142,26 @@ def tune_xgb(X_train, y_train) -> dict:
     return study.best_params
 
 
+def compute_metrics(y_test, pred) -> dict:
+    mse = mean_squared_error(y_test, pred)
+    success_rate = float(np.mean(np.abs(np.asarray(y_test) - np.asarray(pred)) <= SUCCESS_TOLERANCE))
+    return {
+        "mse": mse,
+        "rmse": mse**0.5,
+        "mae": mean_absolute_error(y_test, pred),
+        "r2": r2_score(y_test, pred),
+        "success_rate_within_10pts": success_rate,
+    }
+
+
 def evaluate(name, model, X_test, y_test) -> dict:
     pred = model.predict(X_test)
-    mse = mean_squared_error(y_test, pred)
-    mae = mean_absolute_error(y_test, pred)
-    log.info(f"  {name}: MSE={mse:.2f}, MAE={mae:.2f}")
-    return {"mse": mse, "mae": mae}
+    metrics = compute_metrics(y_test, pred)
+    log.info(
+        f"  {name}: RMSE={metrics['rmse']:.2f}, MAE={metrics['mae']:.2f}, "
+        f"R2={metrics['r2']:.2f}, success_rate(±{SUCCESS_TOLERANCE}pts)={metrics['success_rate_within_10pts']:.0%}"
+    )
+    return metrics
 
 
 def main():
@@ -202,15 +222,20 @@ def main():
                 hidden_layer_sizes=(16, 8), max_iter=2000, random_state=RANDOM_STATE, early_stopping=True
             ).fit(scaler.transform(X_train), y_train)
             pred = nn.predict(scaler.transform(X_test))
-            results["small_nn"] = {
-                "mse": mean_squared_error(y_test, pred),
-                "mae": mean_absolute_error(y_test, pred),
-            }
-            log.info(f"  Small NN: MSE={results['small_nn']['mse']:.2f}, MAE={results['small_nn']['mae']:.2f}")
+            results["small_nn"] = compute_metrics(y_test, pred)
+            log.info(
+                f"  Small NN: RMSE={results['small_nn']['rmse']:.2f}, MAE={results['small_nn']['mae']:.2f}, "
+                f"R2={results['small_nn']['r2']:.2f}, "
+                f"success_rate(±{SUCCESS_TOLERANCE}pts)={results['small_nn']['success_rate_within_10pts']:.0%}"
+            )
             mlflow.log_metrics(results["small_nn"])
 
         winner_name = min(results, key=lambda k: results[k]["mse"])
-        log.info(f"Winner: {winner_name} (MSE={results[winner_name]['mse']:.2f})")
+        log.info(
+            f"Winner: {winner_name} (RMSE={results[winner_name]['rmse']:.2f}, "
+            f"R2={results[winner_name]['r2']:.2f}, "
+            f"success_rate={results[winner_name]['success_rate_within_10pts']:.0%})"
+        )
         mlflow.log_param("winner", winner_name)
 
     # Retrain winner on the full labeled set for production predictions
