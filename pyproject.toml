@@ -17,7 +17,7 @@ dependencies = [
 # Phase 1 — OSM bulk ingestion (osmium was installed globally during the
 # original Phase 1 session and never actually declared here — a real gap,
 # found while re-running ingestion to fix the landmark tag-coverage bug)
-ingestion = ["osmium"]
+ingestion = ["osmium", "shapely"]
 # Phase 4 — Reddit signal pipeline
 reddit = ["playwright", "flashtext", "geonamescache", "pycountry"]
 # Phase 5 — ML/LLM distillation loop
