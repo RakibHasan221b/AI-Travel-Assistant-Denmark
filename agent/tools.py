@@ -29,6 +29,7 @@ That batch script keeps using sentence-transformers; it runs locally, not
 on Render, so its memory footprint was never the problem.
 """
 
+import math
 import os
 from datetime import datetime
 
@@ -39,6 +40,44 @@ from fastembed import TextEmbedding
 from pgvector.psycopg import register_vector
 
 load_dotenv()
+
+# Set once per plan_trip() call, before crew.kickoff() — a module-level
+# global, not a per-request object, because crewai's @tool functions are
+# plain module-level functions with no natural place to inject per-request
+# state. Same "fine at this project's demo scale" trade-off as the DB
+# connection pattern above: a real concurrent-request server would need
+# this threaded through properly instead. See agent/crew.py's plan_trip().
+_trip_start: dict = {"lat": None, "lon": None, "label": None}
+
+
+def set_trip_start(lat: float | None, lon: float | None, label: str) -> None:
+    _trip_start["lat"], _trip_start["lon"], _trip_start["label"] = lat, lon, label
+
+
+# Average speeds used for the estimate, not a routed distance — deliberately
+# not a real transit API. Checked Rejseplanen (Denmark's official journey
+# planner, the "right" real data source here): it requires a manual
+# approval process (contact form, wait for a human, then set a password),
+# not an instant free key, so it's a documented future upgrade, not
+# something to block this feature on. Copenhagen is flat and very
+# bike-friendly, so these are reasonable real-world averages, not
+# arbitrary guesses.
+WALK_KMH = 5.0
+BIKE_KMH = 15.0
+
+# Past this many minutes, walking stops being a realistic suggestion —
+# nudge toward public transit instead, honestly (no fake bus/line number,
+# since that needs real routing data this project doesn't have access to).
+WALK_MINUTES_LIMIT = 15
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 _embed_model: TextEmbedding | None = None
@@ -196,6 +235,45 @@ def place_details(place_name: str) -> str:
     else:
         lines.append("AI summary: not available (no linked review text for this place).")
     return "\n".join(lines)
+
+
+@tool
+def travel_time_estimate(place_name: str) -> str:
+    """Estimates straight-line distance and walk/bike time from the
+    traveler's starting point to a named place. Only useful if a starting
+    point was actually given — if it wasn't, says so plainly instead of
+    guessing a location. Not a routed transit time (no bus/metro line
+    lookup) — say "roughly" when quoting it. If walking would take more
+    than 15 minutes, suggests biking or public transit instead of walking."""
+    if _trip_start["lat"] is None:
+        return "No starting location was given for this trip, so travel time can't be estimated."
+
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT lat, lon FROM places WHERE name ILIKE %(name)s "
+            "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
+            {"name": f"%{place_name}%", "exact": place_name},
+        )
+        row = cur.fetchone()
+    if not row:
+        return f"No place found matching '{place_name}' to estimate travel time for."
+
+    dist_km = haversine_km(_trip_start["lat"], _trip_start["lon"], row[0], row[1])
+    walk_min = round(dist_km / WALK_KMH * 60)
+    bike_min = round(dist_km / BIKE_KMH * 60)
+
+    if walk_min > WALK_MINUTES_LIMIT:
+        return (
+            f"From {_trip_start['label']}: roughly {dist_km:.1f} km straight-line — "
+            f"that's too far to walk comfortably (~{walk_min} min). Biking is doable "
+            f"(~{bike_min} min). Otherwise, Copenhagen's Metro/S-train network covers "
+            f"most of the city well — worth checking a real route, since exact bus/train "
+            f"lines aren't available here."
+        )
+    return (
+        f"From {_trip_start['label']}: roughly {dist_km:.1f} km straight-line, "
+        f"about {walk_min} min walking or {bike_min} min biking."
+    )
 
 
 @tool

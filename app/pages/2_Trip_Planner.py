@@ -41,6 +41,11 @@ with st.form("trip_form"):
         "Area in Copenhagen (optional)",
         ["Any area", "Vesterbro", "Norrebro", "Osterbro", "Frederiksberg", "Indre By"],
     )
+    start_location = st.text_input(
+        "Starting from (optional)",
+        placeholder="Copenhagen Central Station, or your hotel name/address",
+        help="Used to estimate walking/biking distance to recommended places. Skip it and no travel time will be shown.",
+    )
     target_date = st.date_input("Target date", value=COPENHAGEN_TODAY + timedelta(days=1))
     submitted = st.form_submit_button("Plan my trip", type="primary")
 
@@ -53,7 +58,11 @@ if submitted:
             try:
                 resp = requests.post(
                     f"{get_api_url()}/trip-plan",
-                    json={"request": full_request, "target_date": target_date.isoformat()},
+                    json={
+                        "request": full_request,
+                        "target_date": target_date.isoformat(),
+                        "start_location": start_location.strip(),
+                    },
                     timeout=180,
                 )
                 resp.raise_for_status()

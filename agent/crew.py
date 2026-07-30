@@ -8,14 +8,25 @@ principle. crewai.LLM talks to Groq via litellm's "groq/<model>" provider
 prefix, reading GROQ_API_KEY from the environment.
 """
 
+import logging
 import os
 import sys
 import time
 
+import requests
 from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
 
-from agent.tools import place_details, search_places, top_quality_places, weather_conditions
+from agent.tools import (
+    place_details,
+    search_places,
+    set_trip_start,
+    top_quality_places,
+    travel_time_estimate,
+    weather_conditions,
+)
+
+log = logging.getLogger("crew")
 
 load_dotenv()
 
@@ -54,6 +65,30 @@ _crewai_cache.mark_cache_breakpoint = lambda message: dict(message)
 # failure.
 GROQ_MODEL = "groq/llama-3.3-70b-versatile"
 MAX_AGENT_ITER = 6
+
+# Nominatim, same free/no-key service ingestion/osm_live_lookup.py already
+# uses — single call per trip-plan request, well within its 1 req/s usage
+# policy. Not a full geocoding pipeline: on any failure (typo, ambiguous
+# text, network hiccup) this just leaves the trip without a start point
+# rather than guessing or retrying, matching the honesty-over-confidence
+# principle every tool here already follows.
+def geocode(text: str) -> tuple[float, float] | None:
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": f"{text}, Copenhagen, Denmark", "format": "jsonv2", "limit": 1},
+            headers={"User-Agent": "ai-denmark-explorer/0.1 (Copenhagen pilot, personal project)"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if not results:
+            return None
+        return float(results[0]["lat"]), float(results[0]["lon"])
+    except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+        log.warning(f"Geocoding failed for {text!r}: {e}")
+        return None
+
 
 GROUNDING_RULE = (
     "Only state facts your tools actually returned. If a tool found nothing "
@@ -110,7 +145,7 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "each place you recommend, and you never oversell a place with thin evidence. "
             + GROUNDING_RULE
         ),
-        tools=[place_details],
+        tools=[place_details, travel_time_estimate],
         llm=llm,
         max_iter=MAX_AGENT_ITER,
         verbose=True,
@@ -144,11 +179,17 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "call place_details on the 2-3 best-fitting candidates and write a final "
             "recommendation for the traveler's request: {request} (target date: {target_date}). "
             "Cite the quality score and, when available, the AI summary's sources for each "
-            "place you recommend. Do not recommend a place you didn't call place_details on."
+            "place you recommend. Do not recommend a place you didn't call place_details on.\n\n"
+            "Traveler's starting point: {start_location}\n"
+            "If a starting point was given (not 'not provided'), call travel_time_estimate on "
+            "each place you recommend and mention the estimated distance/travel time. If no "
+            "starting point was given, don't call travel_time_estimate and don't mention travel "
+            "time at all — say nothing rather than guessing a location."
         ),
         expected_output=(
             "A final itinerary recommendation: 2-3 places with why each fits, their real "
-            "quality score, and cited sources where available."
+            "quality score, cited sources where available, and — only if a starting point was "
+            "given — an estimated travel time to each."
         ),
         agent=concierge,
         context=[scout_task, conditions_task],
@@ -162,13 +203,33 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     )
 
 
-def plan_trip(request: str, target_date: str, _retry_wait_s: int = 15) -> str:
+def plan_trip(request: str, target_date: str, start_location: str = "", _retry_wait_s: int = 15) -> str:
     """Retries once on a Groq TPM rate-limit hit — the free tier's ceiling
     sits close enough to this crew's per-run token usage that an occasional
-    hit is expected, not exceptional (see GROQ_MODEL comment above)."""
+    hit is expected, not exceptional (see GROQ_MODEL comment above).
+
+    start_location is geocoded once here (zero LLM cost — plain HTTP call),
+    not turned into its own agent tool call: the Concierge's
+    travel_time_estimate tool reads the result via set_trip_start() instead
+    of the agent having to geocode text itself, which would burn tokens on
+    every single run instead of once per request."""
     import litellm
 
-    inputs = {"request": request, "target_date": target_date}
+    if start_location.strip():
+        coords = geocode(start_location)
+        if coords:
+            set_trip_start(coords[0], coords[1], start_location)
+        else:
+            log.warning(f"Could not geocode start_location={start_location!r}, proceeding without it")
+            set_trip_start(None, None, start_location)
+    else:
+        set_trip_start(None, None, "")
+
+    inputs = {
+        "request": request,
+        "target_date": target_date,
+        "start_location": start_location.strip() or "not provided",
+    }
     try:
         return str(build_crew().kickoff(inputs=inputs))
     except litellm.RateLimitError:

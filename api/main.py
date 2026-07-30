@@ -27,6 +27,7 @@ def health():
 class TripPlanRequest(BaseModel):
     request: str
     target_date: str
+    start_location: str = ""
 
 
 class TripPlanResponse(BaseModel):
@@ -38,7 +39,7 @@ def trip_plan(body: TripPlanRequest):
     if not body.request.strip():
         raise HTTPException(400, "request must not be empty")
     try:
-        itinerary = plan_trip(body.request, body.target_date)
+        itinerary = plan_trip(body.request, body.target_date, body.start_location)
     except Exception as e:
         log.exception("Crew run failed")
         raise HTTPException(500, f"Trip planning failed: {e}") from e
