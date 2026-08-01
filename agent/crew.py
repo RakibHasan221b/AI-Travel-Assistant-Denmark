@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from agent.tools import (
     place_details,
     search_places,
+    search_places_near,
     set_trip_start,
     top_quality_places,
     travel_time_estimate,
@@ -95,15 +96,29 @@ class PlaceRecommendation(BaseModel):
     name: str
     category: str
     neighborhood: str = "unknown area"
+    opening_hours: str | None = Field(None, description="From place_details, null if unknown")
     quality_score: float | None = Field(None, description="0-100, null if not available")
     vibe_cluster: str | None = None
     summary: str | None = Field(None, description="The AI-grounded summary, null if not available")
     sources: list[str] = Field(default_factory=list)
-    distance_km: float | None = Field(None, description="null if no starting point was given")
+    distance_km: float | None = Field(
+        None, description="Distance from the TRAVELER'S starting point (travel_time_estimate) — null if no starting point was given"
+    )
     walk_minutes: int | None = None
     bike_minutes: int | None = None
     travel_note: str | None = Field(
         None, description="e.g. 'too far to walk comfortably, consider transit' — null if walking is fine or no starting point given"
+    )
+    near_place: str | None = Field(
+        None,
+        description="If this place was found via search_places_near (because the request said "
+        "'near <some other place>'), the name of that other place — otherwise null.",
+    )
+    near_distance_km: float | None = Field(
+        None,
+        description="If near_place is set, the real distance to it from search_places_near's "
+        "result — this is a DIFFERENT number from distance_km, which is distance from the "
+        "traveler's own starting point, not from another recommended place. Null if near_place is null.",
     )
     why_recommended: str = Field(description="1-2 sentences on why this place fits the request")
 
@@ -119,7 +134,9 @@ class TripPlanOutput(BaseModel):
     places: list[PlaceRecommendation]
     weather_summary: str = Field(description="1-2 sentences on conditions for the target date")
     overall_note: str = Field(
-        default="", description="Optional closing note — only for something that doesn't fit under a specific place, e.g. a caveat about data availability"
+        default="",
+        description="Required: 2-4 sentences tying the whole recommendation together in a warm, "
+        "connected way, like a real concierge speaking — not just a leftover caveat.",
     )
 
 
@@ -150,7 +167,7 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "You know Copenhagen's places inventory cold. You never suggest a place "
             "your tools didn't actually return. " + GROUNDING_RULE
         ),
-        tools=[search_places, top_quality_places],
+        tools=[search_places, search_places_near, top_quality_places],
         llm=llm,
         max_iter=MAX_AGENT_ITER,
         verbose=True,
@@ -187,17 +204,29 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     scout_task = Task(
         description=(
             "Traveler request: {request}\n\n"
-            "If the traveler named one specific place (e.g. 'the Little Mermaid', 'Torvehallerne'), "
-            "find just that place and confirm it exists — do not pad the list with unrelated extra "
-            "candidates just because a broader search surfaces them. Only if the request is genuinely "
-            "open-ended (a vibe, category, or 'best of' request, not one named place) should you find "
-            "3-5 candidates: use search_places for vibe/description matches and top_quality_places if "
-            "the request is about finding the best-rated places. List only places your tools actually "
-            "returned."
+            "First, work out what parts of the request you need to cover — a request can have more "
+            "than one part (e.g. 'see the Little Mermaid AND have coffee nearby' has two parts: a "
+            "named place, and an open-ended category). Cover every part, but only that many:\n"
+            "- A named place (e.g. 'the Little Mermaid', 'Torvehallerne') → find just that place, "
+            "confirm it exists. Do not add unrelated extra candidates for this part.\n"
+            "- An open-ended part that says it's near/close to/around ANOTHER specific named place "
+            "(e.g. 'coffee nearby' when a landmark was also named, 'a hotel near Torvehallerne') → "
+            "use search_places_near with that other place as the anchor. This ranks by real "
+            "geographic distance, not wording — do not use search_places for this, since text "
+            "similarity alone doesn't mean something is actually close by.\n"
+            "- An open-ended part with no reference point (a vibe, category, or 'best of' request "
+            "with nothing to be near, e.g. 'a cozy cafe somewhere in the city') → find 1-3 real "
+            "candidates with search_places (vibe/description match) or top_quality_places "
+            "(best-rated).\n"
+            "If the request is ONLY a named place with no open-ended part, return just that place. "
+            "If it's ONLY open-ended with no named place, return 3-5 candidates for it. If it's both, "
+            "return both parts — do not silently drop the open-ended part just because a named place "
+            "was also mentioned. List only places your tools actually returned."
         ),
         expected_output=(
-            "Either one specific place (if the traveler named one) or a short list of 3-5 candidates "
-            "(if the request was open-ended), each with category and neighborhood."
+            "Every distinct part of the request covered: the named place if one was given, and/or "
+            "candidates for the open-ended part if one was given — each with category and "
+            "neighborhood. Never fewer parts than the request actually asked for."
         ),
         agent=place_scout,
     )
@@ -216,16 +245,24 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     concierge_task = Task(
         description=(
             "Using the Place Scout's candidates and the Conditions Analyst's timing note, "
-            "call place_details on the 2-3 best-fitting candidates for the traveler's request: "
-            "{request} (target date: {target_date}). Fill in each field from what place_details "
-            "actually returned — leave a field null rather than guessing if it wasn't available. "
-            "Do not recommend a place you didn't call place_details on.\n\n"
-            "If the traveler named one specific place, your `places` list should contain only "
-            "that place — do not pad it with other candidates the Scout found 'just in case.' "
-            "Only include multiple places if the traveler's request was genuinely open-ended "
-            "(a vibe or category, not one named place).\n\n"
+            "call place_details on EVERY place the Scout returned for the traveler's request: "
+            "{request} (target date: {target_date}) — not just the single best one. If the Scout "
+            "covered more than one part of the request (e.g. a named place AND an open-ended "
+            "category), your `places` list must include a result for each part; do not collapse "
+            "it down to only one place. Fill in name/category/neighborhood/opening_hours/"
+            "quality_score/vibe_cluster/summary/sources from what place_details actually returned "
+            "— leave a field null rather than guessing if it wasn't available. Do not recommend a "
+            "place you didn't call place_details on.\n\n"
+            "If the Scout's notes say a place was found via search_places_near (they'll mention a "
+            "real distance like '0.32 km from Den lille Havfrue'), set near_place to that other "
+            "place's name and near_distance_km to that exact number from the Scout's notes — do "
+            "not invent or round it. Leave both null for places found any other way.\n\n"
             "weather_summary must always be filled in from the Conditions Analyst's note — "
             "never leave it empty.\n\n"
+            "overall_note: write 2-4 sentences that tie the whole recommendation together like a "
+            "real travel concierge would say out loud — not a leftover caveat field. Mention how "
+            "the places relate to each other or to the day's conditions, and give a genuine "
+            "closing recommendation. This is required, not optional — never leave it empty.\n\n"
             "Traveler's starting point: {start_location}\n"
             "If a starting point was given (not 'not provided'), call travel_time_estimate on "
             "each place and fill in distance_km/walk_minutes/bike_minutes/travel_note from its "
@@ -233,9 +270,12 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "guess a location."
         ),
         expected_output=(
-            "A TripPlanOutput: each recommended place with its real quality score, sources, and "
-            "why it fits, a weather summary for the target date, and travel time fields filled "
-            "in only if a starting point was given."
+            "A TripPlanOutput: every place the Scout found (not just one, unless the Scout only "
+            "found one), each with its real quality score, hours, sources, and why it fits; "
+            "near_place/near_distance_km filled in for places found via search_places_near; a "
+            "weather summary for the target date; travel time fields filled in only if a "
+            "starting point was given; and a real 2-4 sentence overall_note tying the "
+            "recommendation together."
         ),
         agent=concierge,
         context=[scout_task, conditions_task],

@@ -6,9 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent.tools import (
+    _coerce_limit,
     haversine_km,
     place_details,
     search_places,
+    search_places_near,
     set_trip_start,
     top_quality_places,
     travel_time_estimate,
@@ -16,7 +18,8 @@ from agent.tools import (
 )
 
 EXPECTED_TOOLS = [
-    search_places, top_quality_places, place_details, travel_time_estimate, weather_conditions,
+    search_places, search_places_near, top_quality_places, place_details,
+    travel_time_estimate, weather_conditions,
 ]
 
 
@@ -46,3 +49,19 @@ def test_haversine_km_known_distance():
 
 def test_haversine_km_zero_distance_for_same_point():
     assert haversine_km(55.68, 12.57, 55.68, 12.57) == 0.0
+
+
+def test_coerce_limit_accepts_a_real_int():
+    assert _coerce_limit(5) == 5
+
+
+def test_coerce_limit_accepts_a_stringified_int():
+    # The actual live bug: Groq/Llama sometimes sends '"limit": "3"' (a JSON
+    # string) instead of an integer, which Groq's own schema validation
+    # used to reject outright before this coercion existed.
+    assert _coerce_limit("3") == 3
+
+
+def test_coerce_limit_falls_back_to_default_on_garbage():
+    assert _coerce_limit("not-a-number") == 5
+    assert _coerce_limit(None) == 5

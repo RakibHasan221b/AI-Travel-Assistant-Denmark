@@ -34,6 +34,7 @@ class PlaceRecommendation(BaseModel):
     name: str
     category: str
     neighborhood: str = "unknown area"
+    opening_hours: str | None = None
     quality_score: float | None = None
     vibe_cluster: str | None = None
     summary: str | None = None
@@ -42,6 +43,8 @@ class PlaceRecommendation(BaseModel):
     walk_minutes: int | None = None
     bike_minutes: int | None = None
     travel_note: str | None = None
+    near_place: str | None = None
+    near_distance_km: float | None = None
     why_recommended: str
 
 

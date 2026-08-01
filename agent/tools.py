@@ -96,6 +96,22 @@ def _connect():
     return conn
 
 
+def _coerce_limit(limit: int | str, default: int = 5) -> int:
+    """search_places/top_quality_places declare limit as int | str, not just
+    int — found live: Groq/Llama's tool-call generation sometimes sends
+    numeric-looking arguments as JSON strings (e.g. "5" instead of 5), and
+    Groq's own server-side schema validation rejects the whole call outright
+    when that doesn't match a strict `integer` type, before our code ever
+    runs (confirmed: the rejection is a GroqException from the API itself,
+    not a local error we could catch and coerce after the fact). Widening
+    the declared type to accept what the model actually tends to send, and
+    coercing here, fixes this at the only point it can be fixed."""
+    try:
+        return int(limit)
+    except (TypeError, ValueError):
+        return default
+
+
 def _resolve_place(cur, place_name: str) -> tuple | None:
     """Returns (place_id, name, lat, lon) for the best-matching place, or
     None. Tries an exact/substring name match first (cheap, precise); falls
@@ -127,7 +143,7 @@ def _resolve_place(cur, place_name: str) -> tuple | None:
 
 
 @tool
-def search_places(query: str, category: str = "", neighborhood: str = "", limit: int = 5) -> str:
+def search_places(query: str, category: str = "", neighborhood: str = "", limit: int | str = 5) -> str:
     """Semantic search over Copenhagen places (pgvector). Use this to find
     candidate places matching a vibe or description, e.g. "cozy quiet cafe
     good for working". Optionally filter by category (restaurant, cafe,
@@ -140,7 +156,7 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
         FROM places
         WHERE embedding IS NOT NULL
     """
-    params = {"qvec": query_embedding, "limit": limit}
+    params = {"qvec": query_embedding, "limit": _coerce_limit(limit)}
     if category:
         sql += " AND category = %(category)s"
         params["category"] = category
@@ -164,7 +180,48 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
 
 
 @tool
-def top_quality_places(category: str = "", neighborhood: str = "", limit: int = 5) -> str:
+def search_places_near(anchor_place: str, category: str = "", limit: int | str = 5) -> str:
+    """Finds real places near ANOTHER named place, ranked by actual
+    geographic distance — not text/semantic similarity, which only
+    approximates proximity through wording and can return places that
+    aren't really close. Use this whenever the request says something is
+    near/close to/around another specific named place (e.g. "coffee near
+    the Little Mermaid", "a hotel near Torvehallerne") — use search_places
+    instead for a request with no such reference point. Optionally filter
+    by category (restaurant, cafe, hotel, landmark, bar)."""
+    limit = _coerce_limit(limit)
+    with _connect() as conn, conn.cursor() as cur:
+        anchor = _resolve_place(cur, anchor_place)
+        if not anchor:
+            return f"No place found matching '{anchor_place}' to search near."
+        anchor_id, anchor_name, anchor_lat, anchor_lon = anchor
+
+        sql = "SELECT name, category, neighborhood, opening_hours, lat, lon FROM places WHERE place_id != %(anchor_id)s"
+        params = {"anchor_id": anchor_id}
+        if category:
+            sql += " AND category = %(category)s"
+            params["category"] = category
+        cur.execute(sql, params)
+        columns = [d.name for d in cur.description]
+        rows = [dict(zip(columns, r)) for r in cur.fetchall()]
+
+    for r in rows:
+        r["distance_km"] = haversine_km(anchor_lat, anchor_lon, r["lat"], r["lon"])
+    rows.sort(key=lambda r: r["distance_km"])
+    rows = rows[:limit]
+
+    if not rows:
+        scope = f" in category '{category}'" if category else ""
+        return f"No places found near {anchor_name}{scope}."
+    return "\n".join(
+        f"- {r['name']} ({r['category']}, {r['neighborhood'] or 'unknown area'}), "
+        f"{r['distance_km']:.2f} km from {anchor_name}, hours: {r['opening_hours'] or 'unknown'}"
+        for r in rows
+    )
+
+
+@tool
+def top_quality_places(category: str = "", neighborhood: str = "", limit: int | str = 5) -> str:
     """Ranks Copenhagen places by predicted quality score (0-100, Phase 9
     XGBoost model), optionally filtered by category and/or neighborhood. Use
     this when the request is about the *best-rated* places rather than a
@@ -175,7 +232,7 @@ def top_quality_places(category: str = "", neighborhood: str = "", limit: int = 
         JOIN ml_predictions m ON m.place_id = p.place_id AND m.target = 'quality_score'
         WHERE 1=1
     """
-    params: dict = {"limit": limit}
+    params: dict = {"limit": _coerce_limit(limit)}
     if category:
         sql += " AND p.category = %(category)s"
         params["category"] = category

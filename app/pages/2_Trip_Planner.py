@@ -61,9 +61,13 @@ def render_trip_plan(result: dict) -> None:
             meta_bits = []
             if place.get("vibe_cluster"):
                 meta_bits.append(f"Vibe: *{place['vibe_cluster']}*")
+            if place.get("opening_hours"):
+                meta_bits.append(f"🕐 {place['opening_hours']}")
+            if place.get("near_place") and place.get("near_distance_km") is not None:
+                meta_bits.append(f"🚶 {place['near_distance_km']:.2f} km from {place['near_place']}")
             if place.get("distance_km") is not None:
                 if place.get("travel_note"):
-                    meta_bits.append(f"📍 {place['distance_km']:.1f} km — {place['travel_note']}")
+                    meta_bits.append(f"📍 {place['distance_km']:.1f} km from your start — {place['travel_note']}")
                 else:
                     time_bits = []
                     if place.get("walk_minutes") is not None:
@@ -71,7 +75,7 @@ def render_trip_plan(result: dict) -> None:
                     if place.get("bike_minutes") is not None:
                         time_bits.append(f"{place['bike_minutes']} min bike")
                     time_str = f" ({' / '.join(time_bits)})" if time_bits else ""
-                    meta_bits.append(f"📍 {place['distance_km']:.1f} km{time_str}")
+                    meta_bits.append(f"📍 {place['distance_km']:.1f} km from your start{time_str}")
             if meta_bits:
                 st.caption(" · ".join(meta_bits))
 
@@ -82,7 +86,8 @@ def render_trip_plan(result: dict) -> None:
                 st.caption("Sources: " + ", ".join(place["sources"]))
 
     if result.get("overall_note"):
-        st.caption(result["overall_note"])
+        st.markdown("##### Overall")
+        st.write(result["overall_note"])
 
 
 with st.form("trip_form"):
