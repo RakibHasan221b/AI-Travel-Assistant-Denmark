@@ -6,8 +6,7 @@ multi-agent orchestration, classical ML, and real deployment engineering —
 built, deployed, and debugged solo, entirely on free-tier infrastructure.
 
 **[🔴 Live app](https://ai-travel-assistant-dk.streamlit.app/)** ·
-**[⚙️ Live API](https://ai-denmark-explorer-api.onrender.com/health)** ·
-**[📄 Architecture write-up](docs/architecture_explainer.html)**
+**[⚙️ Live API](https://ai-denmark-explorer-api.onrender.com/health)**
 
 ## What it does
 
@@ -84,9 +83,10 @@ pytest
 
 `pip install -e ".[dev,embeddings,rag,agent]"` pulls in `crewai`, which
 depends on `torch` — and torch's own bundled license files are nested deep
-enough that combined with a long project path (e.g. this repo's, under
-`...\CLAUDE PROJECTS\ai-denmark-explorer\.venv\...`), the install can hit
-Windows' 260-character path limit. If that happens, create the venv at a
+enough that combined with a long project path (e.g.
+`...\deeply\nested\parent\folder\ai-denmark-explorer\.venv\...`), the
+install can hit Windows' 260-character path limit. If that happens, create
+the venv at a
 short path outside the project instead, e.g.:
 
 ```bash
