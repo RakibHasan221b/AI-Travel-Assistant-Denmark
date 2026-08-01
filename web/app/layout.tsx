@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Schibsted_Grotesk, JetBrains_Mono } from "next/font/google";
+import { NavBar } from "@/components/NavBar";
 import "./globals.css";
 
 // Schibsted Grotesk: designed for the Norwegian media group Schibsted —
@@ -18,9 +19,12 @@ const dataMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Trip Planner — AI Denmark Explorer",
+  title: {
+    default: "AI Denmark Explorer",
+    template: "%s — AI Denmark Explorer",
+  },
   description:
-    "Three AI agents plan a real Copenhagen trip, grounded in real places, weather, and quality scores.",
+    "Real Copenhagen places, grounded in real data — search, plan a trip, and see the stats behind it.",
 };
 
 export default function RootLayout({
@@ -33,7 +37,10 @@ export default function RootLayout({
       lang="en"
       className={`${display.variable} ${dataMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        <NavBar />
+        {children}
+      </body>
     </html>
   );
 }

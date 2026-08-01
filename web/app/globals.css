@@ -17,6 +17,19 @@
   --accent-soft: #f6dcdd;
   --secondary: #1f3a5c;
   --secondary-soft: #dde5ed;
+
+  /* Categorical chart colors — only needed by the outdoor-interest forecast
+     line chart (up to 5 place categories). Single-series bar charts reuse
+     --accent instead: a nominal category doesn't need per-bar color when
+     position + axis label already carry identity. Validated with the
+     dataviz skill's palette validator against this file's own --surface
+     values — CVD-safe (worst adjacent ΔE 9.1) and passes the normal-vision
+     contrast floor in both themes. */
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
+  --chart-3: #1baf7a;
+  --chart-4: #eda100;
+  --chart-5: #e87ba4;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -33,6 +46,11 @@
     --accent-soft: #3a201d;
     --secondary: #7ea3c9;
     --secondary-soft: #1c2c3c;
+    --chart-1: #3987e5;
+    --chart-2: #d95926;
+    --chart-3: #199e70;
+    --chart-4: #c98500;
+    --chart-5: #d55181;
   }
 }
 
@@ -49,6 +67,11 @@
   --color-accent-soft: var(--accent-soft);
   --color-secondary: var(--secondary);
   --color-secondary-soft: var(--secondary-soft);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
   --font-sans: var(--font-display);
   --font-mono: var(--font-data);
 }

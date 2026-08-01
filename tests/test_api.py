@@ -17,6 +17,8 @@ def test_expected_routes_are_registered():
     paths = {route.path for route in app.routes}
     assert "/health" in paths
     assert "/trip-plan" in paths
+    assert "/explore" in paths
+    assert "/stats" in paths
 
 
 def test_cors_middleware_is_registered():

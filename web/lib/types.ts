@@ -29,3 +29,56 @@ export interface TripPlanResponse {
   weather_summary: string;
   overall_note: string;
 }
+
+export interface ExplorePlaceResult {
+  name: string;
+  category: string;
+  neighborhood: string;
+  opening_hours: string | null;
+  similarity: number;
+  quality_score: number | null;
+  vibe_cluster: string | null;
+  summary: string | null;
+  sources: string[];
+}
+
+export interface ExploreResponse {
+  results: ExplorePlaceResult[];
+}
+
+export interface NeighborhoodQuality {
+  neighborhood: string;
+  avg_quality_score: number;
+  n_places: number;
+}
+
+export interface CategoryQuality {
+  category: string;
+  avg_quality_score: number;
+  n_places: number;
+}
+
+export interface VibeClusterSize {
+  label: string;
+  n_places: number;
+}
+
+export interface RatedAspect {
+  aspect_category: string;
+  mean_score: number;
+  total_mentions: number;
+}
+
+export interface ForecastPoint {
+  forecast_date: string;
+  category: string;
+  avg_interest: number;
+}
+
+export interface StatsResponse {
+  quality_by_neighborhood: NeighborhoodQuality[];
+  quality_by_category: CategoryQuality[];
+  vibe_cluster_sizes: VibeClusterSize[];
+  rated_aspects: RatedAspect[];
+  outdoor_interest_forecast: ForecastPoint[];
+}

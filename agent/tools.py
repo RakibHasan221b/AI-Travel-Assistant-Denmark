@@ -27,6 +27,13 @@ before switching) — same embedding space as what Phase 6's batch ingestion
 script already wrote to the DB, just a lighter runtime for the live API.
 That batch script keeps using sentence-transformers; it runs locally, not
 on Render, so its memory footprint was never the problem.
+
+connect() and get_embed_model() are also imported directly by api/main.py's
+/explore and /stats routes — render.yaml runs one process, and api/main.py
+already imports agent.crew, which already imports this module, so that
+process already holds one fastembed instance. Sharing these two helpers
+keeps it at one instance/one connection pattern instead of a second,
+memory-doubling copy in a second "private" module.
 """
 
 import math
@@ -106,14 +113,14 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 _embed_model: TextEmbedding | None = None
 
 
-def _get_embed_model() -> TextEmbedding:
+def get_embed_model() -> TextEmbedding:
     global _embed_model
     if _embed_model is None:
         _embed_model = TextEmbedding(model_name=EMBED_MODEL_NAME)
     return _embed_model
 
 
-def _connect():
+def connect():
     conn = psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=15)
     register_vector(conn)
     return conn
@@ -155,7 +162,7 @@ def _resolve_place(cur, place_name: str) -> tuple | None:
     if row:
         return row
 
-    model = _get_embed_model()
+    model = get_embed_model()
     query_embedding = next(model.embed([place_name]))
     cur.execute(
         "SELECT place_id, name, lat, lon FROM places WHERE embedding IS NOT NULL "
@@ -171,7 +178,7 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
     candidate places matching a vibe or description, e.g. "cozy quiet cafe
     good for working". Optionally filter by category (restaurant, cafe,
     hotel, landmark, bar) and/or neighborhood."""
-    model = _get_embed_model()
+    model = get_embed_model()
     query_embedding = next(model.embed([query]))
     sql = """
         SELECT name, category, neighborhood, opening_hours,
@@ -188,7 +195,7 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
         params["neighborhood"] = neighborhood
     sql += " ORDER BY embedding <=> %(qvec)s LIMIT %(limit)s;"
 
-    with _connect() as conn, conn.cursor() as cur:
+    with connect() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         columns = [d.name for d in cur.description]
         rows = [dict(zip(columns, r)) for r in cur.fetchall()]
@@ -213,7 +220,7 @@ def search_places_near(anchor_place: str, category: str = "", limit: int | str =
     instead for a request with no such reference point. Optionally filter
     by category (restaurant, cafe, hotel, landmark, bar)."""
     limit = _coerce_limit(limit)
-    with _connect() as conn, conn.cursor() as cur:
+    with connect() as conn, conn.cursor() as cur:
         anchor = _resolve_place(cur, anchor_place)
         if not anchor:
             return f"No place found matching '{anchor_place}' to search near."
@@ -318,7 +325,7 @@ def top_quality_places(category: str = "", neighborhood: str = "", limit: int | 
         params["neighborhood"] = neighborhood
     sql += " ORDER BY m.predicted_value DESC LIMIT %(limit)s;"
 
-    with _connect() as conn, conn.cursor() as cur:
+    with connect() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         columns = [d.name for d in cur.description]
         rows = [dict(zip(columns, r)) for r in cur.fetchall()]
@@ -339,7 +346,7 @@ def place_details(place_name: str) -> str:
     cluster, rated aspects, and its RAG-grounded AI summary with cited
     sources. Use this before finalizing a recommendation for a specific
     place — never state a fact about a place that isn't returned here."""
-    with _connect() as conn, conn.cursor() as cur:
+    with connect() as conn, conn.cursor() as cur:
         resolved = _resolve_place(cur, place_name)
         if not resolved:
             return f"No place found matching '{place_name}'."
@@ -414,7 +421,7 @@ def travel_time_estimate(place_name: str) -> str:
     if _trip_start["lat"] is None:
         return "No starting location was given for this trip, so travel time can't be estimated."
 
-    with _connect() as conn, conn.cursor() as cur:
+    with connect() as conn, conn.cursor() as cur:
         resolved = _resolve_place(cur, place_name)
     if not resolved:
         return f"No place found matching '{place_name}' to estimate travel time for."
@@ -453,7 +460,7 @@ def weather_conditions(target_date: str, category: str = "") -> str:
     except ValueError:
         return f"Could not parse '{target_date}' as a date (expected YYYY-MM-DD)."
 
-    with _connect() as conn, conn.cursor() as cur:
+    with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT temp_max_c, temp_min_c, precip_mm, wind_kph FROM weather_daily WHERE date = %s;",
             (d,),
