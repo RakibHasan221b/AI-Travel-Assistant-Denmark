@@ -1,18 +1,23 @@
 # AI Denmark Explorer
 
 An AI-powered place-discovery app for Copenhagen that doubles as a
-deliberate showcase of the modern AI/ML stack — SQL, embeddings, RAG,
-multi-agent orchestration, classical ML, and real deployment engineering —
-built, deployed, and debugged solo, entirely on free-tier infrastructure.
+deliberate showcase of the modern full-stack AI/ML toolkit — SQL,
+embeddings, RAG, multi-agent orchestration, classical ML, a React/Next.js
+frontend, and real deployment engineering — built, deployed, and debugged
+solo, entirely on free-tier infrastructure.
 
-**[🔴 Live app](https://ai-travel-assistant-dk.streamlit.app/)** ·
+**[🔴 Live app (React/Next.js)](https://ai-denmark-explorer.vercel.app/)** ·
+**[🔴 Live app (Streamlit)](https://ai-travel-assistant-dk.streamlit.app/)** ·
 **[⚙️ Live API](https://ai-denmark-explorer-api.onrender.com/health)**
+
+Two live frontends, one shared FastAPI/Postgres backend — the React app is
+the actively-developed one; Streamlit stays live alongside it.
 
 ## What it does
 
 - **Explore** — semantic ("vibe") search over 1,896 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
-- **Trip Planner** — three [CrewAI](https://www.crewai.com/) agents (Place Scout, Conditions Analyst, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite.
-- **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres, not pre-baked.
+- **Trip Planner** — three [CrewAI](https://www.crewai.com/) agents (Place Scout, Conditions Analyst, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite. A live-lookup fallback (Nominatim) honestly flags any place outside the curated, scored dataset instead of pretending it has the same evidence behind it. Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
+- **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts.
 
 ## Key results
 
@@ -37,7 +42,8 @@ that got root-caused and fixed with evidence, not guessed at:
 **Data**: PostgreSQL (Neon) · pgvector · OpenStreetMap · Wikivoyage · Open-Meteo · opendata.dk / DAWA
 **ML**: scikit-learn · XGBoost · Optuna · MLflow · sentence-transformers / fastembed
 **LLM / Agents**: GPT-4o · Groq (Llama 3.3 70B) · LangChain · CrewAI
-**App**: FastAPI (Render) · Streamlit (Streamlit Community Cloud)
+**Backend**: FastAPI (Render)
+**Frontend**: React · Next.js (App Router, Server + Client Components) · TypeScript · Tailwind CSS · Recharts, deployed on Vercel — plus Streamlit (Streamlit Community Cloud)
 **Quality**: pytest · ruff · GitHub Actions CI
 
 See [`docs/technique_map.md`](docs/technique_map.md) for the full technique-to-implementation mapping.
@@ -60,13 +66,15 @@ See [`docs/technique_map.md`](docs/technique_map.md) for the full technique-to-i
 | 11 | CrewAI trip-planning crew + API | done — Place Scout / Conditions Analyst / Concierge (Groq llama-3.3-70b), thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
 | 12 | Deployment | **live** — API on Render, app on Streamlit Community Cloud. See `docs/deployment_troubleshooting.md` for the real debugging story |
 | 13 | Portfolio write-up | this README, plus a CV/LinkedIn version |
-| 14 | React/TS/Vercel frontend (optional) | not started, deprioritized |
+| 14 | React/Next.js/TypeScript frontend | **live** — all three pages (Explore, Trip Planner, Stats Dashboard) rebuilt in Next.js (App Router, TypeScript, Tailwind, Recharts), deployed on Vercel, calling the same FastAPI backend directly from the browser |
 
 **Bolt-on additions (not tied to the original phase numbering):** data
 validation on OSM ingestion, an A/B-testing framework for RAG-summary
 prompts, web-search enrichment for thin-data places, point-in-polygon
-neighborhood backfill, and a Trip Planner starting-location + travel-time
-feature. See [`docs/technique_map.md`](docs/technique_map.md) for full details on each.
+neighborhood backfill, a Trip Planner starting-location + travel-time
+feature, a live-lookup fallback tool for places outside the curated dataset,
+and a database-backed cache that serves repeat Trip Planner requests at zero
+LLM cost. See [`docs/technique_map.md`](docs/technique_map.md) for full details on each.
 
 ## Setup
 
@@ -101,6 +109,19 @@ machine.
 
 Run the API: `uvicorn api.main:app --port 8000`, then
 `POST /trip-plan {"request": "...", "target_date": "YYYY-MM-DD", "start_location": "..."}`.
+
+### Frontend (React/Next.js)
+
+```bash
+cd web
+npm install
+cp .env.local.example .env.local   # NEXT_PUBLIC_TRIP_PLANNER_API_URL, defaults to localhost:8000
+npm run dev
+```
+
+Requires the API above running locally (or point `.env.local` at the live
+Render URL). `npm run build` runs the same TypeScript/Next.js checks CI and
+Vercel both run.
 
 ## Data sources
 
