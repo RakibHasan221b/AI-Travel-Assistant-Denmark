@@ -31,9 +31,11 @@ on Render, so its memory footprint was never the problem.
 
 import math
 import os
+import time
 from datetime import datetime
 
 import psycopg
+import requests
 from crewai.tools import tool
 from dotenv import load_dotenv
 from fastembed import TextEmbedding
@@ -238,6 +240,60 @@ def search_places_near(anchor_place: str, category: str = "", limit: int | str =
         f"- {r['name']} ({r['category']}, {r['neighborhood'] or 'unknown area'}), "
         f"{r['distance_km']:.2f} km from {anchor_name}, hours: {r['opening_hours'] or 'unknown'}"
         for r in rows
+    )
+
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_HEADERS = {"User-Agent": "ai-denmark-explorer/0.1 (Copenhagen pilot, personal project)"}
+
+# Same 1 request/second policy as ingestion/osm_live_lookup.py and this
+# module's own trip-start geocoding — a module-level timestamp is enough
+# since a single trip-plan request only ever calls this a handful of times.
+_last_live_lookup = 0.0
+
+
+def _respect_nominatim_rate_limit() -> None:
+    global _last_live_lookup
+    elapsed = time.time() - _last_live_lookup
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+    _last_live_lookup = time.time()
+
+
+@tool
+def search_place_live(query: str) -> str:
+    """Looks up a real place by name via a live OpenStreetMap/Nominatim
+    search — use this ONLY after search_places, search_places_near, and
+    top_quality_places all found nothing for a named place the traveler
+    asked about. This checks whether the place genuinely exists in
+    Copenhagen even though it isn't in our curated dataset.
+
+    A result from this tool has NO quality score, vibe cluster, or AI
+    summary — it was never scored or evaluated. Say so plainly if you use
+    it; never present it with the same confidence as a place found by the
+    other tools."""
+    _respect_nominatim_rate_limit()
+    try:
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"q": f"{query}, Copenhagen, Denmark", "format": "jsonv2", "limit": 1},
+            headers=NOMINATIM_HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        return f"Live lookup failed for '{query}': {e}"
+
+    if not results:
+        return f"No live result found for '{query}' either — it may not exist in Copenhagen."
+
+    r = results[0]
+    name = r.get("name") or query
+    address = r.get("display_name", "address unknown")
+    return (
+        f"LIVE LOOKUP RESULT (not in our curated dataset — no quality score, "
+        f"vibe cluster, or AI summary available): {name}, {address}."
     )
 
 

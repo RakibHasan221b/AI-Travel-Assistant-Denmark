@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from agent.tools import (
     haversine_km,
     place_details,
+    search_place_live,
     search_places,
     search_places_near,
     set_trip_start,
@@ -170,7 +171,7 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "You know Copenhagen's places inventory cold. You never suggest a place "
             "your tools didn't actually return. " + GROUNDING_RULE
         ),
-        tools=[search_places, search_places_near, top_quality_places],
+        tools=[search_places, search_places_near, top_quality_places, search_place_live],
         llm=llm,
         max_iter=MAX_AGENT_ITER,
         verbose=True,
@@ -224,12 +225,18 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "If the request is ONLY a named place with no open-ended part, return just that place. "
             "If it's ONLY open-ended with no named place, return 3-5 candidates for it. If it's both, "
             "return both parts — do not silently drop the open-ended part just because a named place "
-            "was also mentioned. List only places your tools actually returned."
+            "was also mentioned. List only places your tools actually returned.\n\n"
+            "If a NAMED place isn't found by search_places, search_places_near, or top_quality_places "
+            "at all, try search_place_live as a last resort before giving up on it — it checks whether "
+            "the place genuinely exists in Copenhagen even though it's outside our curated, scored "
+            "dataset. Clearly note in your findings that it came from a live lookup, not the dataset."
         ),
         expected_output=(
             "Every distinct part of the request covered: the named place if one was given, and/or "
             "candidates for the open-ended part if one was given — each with category and "
-            "neighborhood. Never fewer parts than the request actually asked for."
+            "neighborhood. Never fewer parts than the request actually asked for. If a named place "
+            "was only found via search_place_live, say so explicitly instead of presenting it as an "
+            "ordinary dataset result."
         ),
         agent=place_scout,
     )
@@ -256,6 +263,11 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "quality_score/vibe_cluster/summary/sources from what place_details actually returned "
             "— leave a field null rather than guessing if it wasn't available. Do not recommend a "
             "place you didn't call place_details on.\n\n"
+            "EXCEPTION: if the Scout found a place only via search_place_live (a live lookup, not "
+            "our dataset), do NOT call place_details on it — it isn't in the database and that call "
+            "would just fail. Instead use exactly what the Scout's live-lookup result said (name, "
+            "address), leave quality_score/vibe_cluster/summary/sources all null, and make "
+            "why_recommended state plainly that this place isn't in our curated, scored dataset.\n\n"
             "If the Scout's notes say a place was found via search_places_near (they'll mention a "
             "real distance like '0.32 km from Den lille Havfrue'), set near_place to that other "
             "place's name and near_distance_km to that exact number from the Scout's notes — do "

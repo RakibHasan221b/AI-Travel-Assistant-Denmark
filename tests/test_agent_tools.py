@@ -5,10 +5,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import requests
+
 from agent.tools import (
     _coerce_limit,
     haversine_km,
     place_details,
+    search_place_live,
     search_places,
     search_places_near,
     set_trip_start,
@@ -19,8 +22,19 @@ from agent.tools import (
 
 EXPECTED_TOOLS = [
     search_places, search_places_near, top_quality_places, place_details,
-    travel_time_estimate, weather_conditions,
+    travel_time_estimate, weather_conditions, search_place_live,
 ]
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
 
 
 def test_tools_have_names_and_descriptions():
@@ -65,3 +79,32 @@ def test_coerce_limit_accepts_a_stringified_int():
 def test_coerce_limit_falls_back_to_default_on_garbage():
     assert _coerce_limit("not-a-number") == 5
     assert _coerce_limit(None) == 5
+
+
+def test_search_place_live_flags_a_found_result_as_not_in_the_curated_dataset(monkeypatch):
+    # Real problem this guards: a live-lookup result must never be mistaken
+    # for a curated, scored place downstream — the agent's honesty about
+    # "no quality score" depends on this exact flag surviving in the string
+    # it reads.
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: _FakeResponse([{"name": "Reffen", "display_name": "Reffen, Copenhagen, Denmark"}]),
+    )
+    result = search_place_live.run(query="Reffen")
+    assert "not in our curated dataset" in result
+    assert "Reffen" in result
+
+
+def test_search_place_live_reports_no_result_plainly(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResponse([]))
+    result = search_place_live.run(query="somewhere that doesn't exist")
+    assert "No live result found" in result
+
+
+def test_search_place_live_handles_a_network_error_without_crashing(monkeypatch):
+    def _raise(*a, **k):
+        raise requests.exceptions.ConnectionError("no network")
+
+    monkeypatch.setattr(requests, "get", _raise)
+    result = search_place_live.run(query="Christiania")
+    assert "Live lookup failed" in result
