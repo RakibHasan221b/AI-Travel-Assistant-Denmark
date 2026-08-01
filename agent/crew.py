@@ -251,3 +251,16 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
     except litellm.RateLimitError:
         time.sleep(_retry_wait_s)
         return str(build_crew().kickoff(inputs=inputs))
+    except litellm.BadRequestError as e:
+        # Occasional malformed tool-call generation (found live: Groq/Llama
+        # sometimes emits <function=...></function> tags instead of proper
+        # JSON, which Groq's strict parser rejects as "tool_use_failed") —
+        # not a rate-limit issue, no cooldown needed, just retry once
+        # immediately. This is a different failure mode than the
+        # llama-3.1-8b-instant malformed-syntax issue noted above (that one
+        # was consistent enough to rule the model out entirely; this is an
+        # occasional glitch on the otherwise-reliable 70b model).
+        if "tool_use_failed" not in str(e):
+            raise
+        log.warning(f"Malformed tool-call generation, retrying once: {e}")
+        return str(build_crew().kickoff(inputs=inputs))
