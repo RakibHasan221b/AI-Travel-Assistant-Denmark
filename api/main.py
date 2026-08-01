@@ -9,6 +9,7 @@ this project's single-user pilot scope.
 import logging
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agent.crew import plan_trip
@@ -17,6 +18,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("api")
 
 app = FastAPI(title="AI Denmark Explorer — Trip Planner")
+
+# Needed once a browser-based client (the Next.js frontend, Phase 14) calls
+# this API directly cross-origin — see docs/technique_map.md. No credentials
+# (cookies/auth) on this endpoint, so a plain origin allowlist is enough; no
+# need for the stricter allow_credentials=True configuration.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    # Vercel gives every branch/PR its own *.vercel.app preview subdomain,
+    # which a fixed allowlist can't cover — match the whole project's
+    # preview + production domains with one regex instead.
+    allow_origin_regex=r"https://ai-denmark-explorer.*\.vercel\.app",
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 
 @app.get("/health")

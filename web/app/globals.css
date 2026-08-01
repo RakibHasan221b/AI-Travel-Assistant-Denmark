@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+/* Design tokens — cool-neutral base, one restrained accent (muted Danish
+   flag red) plus a Copenhagen-harbor blue for secondary emphasis. Grays are
+   tints of the ink color, not Tailwind's default gray scale, so everything
+   stays tonally coherent. See docs/technique_map.md for the design brief. */
+:root {
+  --background: #f6f5f2;
+  --surface: #ffffff;
+  --ink: #16161a;
+  --ink-muted: #5c5b57;
+  --ink-faint: #8a8985;
+  --line: #dcdad3;
+  --line-strong: #c3c0b7;
+  --accent: #c33b3f;
+  --accent-ink: #7a2225;
+  --accent-soft: #f6dcdd;
+  --secondary: #1f3a5c;
+  --secondary-soft: #dde5ed;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #15161a;
+    --surface: #1c1d22;
+    --ink: #eceae4;
+    --ink-muted: #a7a59d;
+    --ink-faint: #726f66;
+    --line: #303138;
+    --line-strong: #42434b;
+    --accent: #e2685c;
+    --accent-ink: #f6cfc9;
+    --accent-soft: #3a201d;
+    --secondary: #7ea3c9;
+    --secondary-soft: #1c2c3c;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-secondary: var(--secondary);
+  --color-secondary-soft: var(--secondary-soft);
+  --font-sans: var(--font-display);
+  --font-mono: var(--font-data);
+}
+
+body {
+  background: var(--background);
+  color: var(--ink);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
