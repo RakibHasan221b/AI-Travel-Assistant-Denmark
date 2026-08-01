@@ -1,7 +1,24 @@
 """Phase 12 — Trip Planner page: calls the Phase 11 FastAPI /trip-plan
 endpoint (the CrewAI crew itself doesn't run in-process here — Streamlit's
 rerun-on-every-interaction model is exactly why Phase 11 put the crew behind
-its own FastAPI service instead, see docs/architecture.md)."""
+its own FastAPI service instead, see docs/architecture.md).
+
+Result rendering, explained (this replaced a single free-text paragraph):
+the Concierge agent now returns structured data (TripPlanOutput — see
+agent/crew.py) instead of prose. This page turns that data into cards,
+the same way app/pages/1_Explore.py already renders search results — same
+visual language across the app, and this formatting step costs zero LLM
+tokens, since it's plain Python running after the agent is already done.
+Asking the LLM to "format nicely" in free text would be less reliable (it's
+just guessing at layout) and would cost tokens on every single request for
+something deterministic code does for free.
+
+Result also lives in st.session_state so it survives Streamlit reruns —
+switching the Area dropdown, or navigating to another page and back, no
+longer wipes it. Before this, the result only existed inside the
+`if submitted:` block's local scope, which Streamlit throws away on the
+next rerun (a form submission button's True/False state doesn't persist).
+"""
 
 import sys
 from datetime import datetime, timedelta
@@ -26,6 +43,47 @@ st.caption(
     "checks real weather, and a Concierge writes the final recommendation grounded in what "
     "the other two actually found."
 )
+
+if "trip_plan_result" not in st.session_state:
+    st.session_state.trip_plan_result = None
+
+
+def render_trip_plan(result: dict) -> None:
+    st.info(f"🌤️ {result['weather_summary']}")
+
+    for place in result["places"]:
+        with st.container(border=True):
+            header_col, score_col = st.columns([4, 1])
+            header_col.markdown(f"**{place['name']}** — {place['category']}, {place['neighborhood']}")
+            if place["quality_score"] is not None:
+                score_col.metric("Quality", f"{place['quality_score']:.0f}/100")
+
+            meta_bits = []
+            if place.get("vibe_cluster"):
+                meta_bits.append(f"Vibe: *{place['vibe_cluster']}*")
+            if place.get("distance_km") is not None:
+                if place.get("travel_note"):
+                    meta_bits.append(f"📍 {place['distance_km']:.1f} km — {place['travel_note']}")
+                else:
+                    time_bits = []
+                    if place.get("walk_minutes") is not None:
+                        time_bits.append(f"{place['walk_minutes']} min walk")
+                    if place.get("bike_minutes") is not None:
+                        time_bits.append(f"{place['bike_minutes']} min bike")
+                    time_str = f" ({' / '.join(time_bits)})" if time_bits else ""
+                    meta_bits.append(f"📍 {place['distance_km']:.1f} km{time_str}")
+            if meta_bits:
+                st.caption(" · ".join(meta_bits))
+
+            st.write(place["why_recommended"])
+            if place.get("summary"):
+                st.caption(place["summary"])
+            if place.get("sources"):
+                st.caption("Sources: " + ", ".join(place["sources"]))
+
+    if result.get("overall_note"):
+        st.caption(result["overall_note"])
+
 
 with st.form("trip_form"):
     request_text = st.text_area(
@@ -66,8 +124,9 @@ if submitted:
                     timeout=180,
                 )
                 resp.raise_for_status()
-                st.success("Here's the plan:")
-                st.write(resp.json()["itinerary"])
+                # Only overwrite on success — a failed new attempt shouldn't
+                # wipe out a plan that already worked.
+                st.session_state.trip_plan_result = resp.json()
             except requests.exceptions.RequestException as e:
                 detail = ""
                 if getattr(e, "response", None) is not None:
@@ -76,3 +135,7 @@ if submitted:
                     except ValueError:
                         detail = e.response.text
                 st.error(f"Trip planning failed: {detail or e}")
+
+if st.session_state.trip_plan_result:
+    st.success("Here's the plan:")
+    render_trip_plan(st.session_state.trip_plan_result)

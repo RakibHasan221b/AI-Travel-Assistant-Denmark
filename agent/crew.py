@@ -16,6 +16,7 @@ import time
 import requests
 from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 from agent.tools import (
     place_details,
@@ -88,6 +89,38 @@ def geocode(text: str) -> tuple[float, float] | None:
     except (requests.exceptions.RequestException, ValueError, KeyError) as e:
         log.warning(f"Geocoding failed for {text!r}: {e}")
         return None
+
+
+class PlaceRecommendation(BaseModel):
+    name: str
+    category: str
+    neighborhood: str = "unknown area"
+    quality_score: float | None = Field(None, description="0-100, null if not available")
+    vibe_cluster: str | None = None
+    summary: str | None = Field(None, description="The AI-grounded summary, null if not available")
+    sources: list[str] = Field(default_factory=list)
+    distance_km: float | None = Field(None, description="null if no starting point was given")
+    walk_minutes: int | None = None
+    bike_minutes: int | None = None
+    travel_note: str | None = Field(
+        None, description="e.g. 'too far to walk comfortably, consider transit' — null if walking is fine or no starting point given"
+    )
+    why_recommended: str = Field(description="1-2 sentences on why this place fits the request")
+
+
+class TripPlanOutput(BaseModel):
+    """Structured trip-plan output — rendered as cards by the Streamlit
+    frontend instead of a single free-text paragraph. Deliberately not
+    asked for via prompt instructions alone ("please output JSON"): CrewAI's
+    output_pydantic uses the instructor library to constrain/validate the
+    LLM's actual response, which is far more reliable than hoping the model
+    follows a formatting instruction on top of its narrative habits."""
+
+    places: list[PlaceRecommendation]
+    weather_summary: str = Field(description="1-2 sentences on conditions for the target date")
+    overall_note: str = Field(
+        default="", description="Optional closing note — only for something that doesn't fit under a specific place, e.g. a caveat about data availability"
+    )
 
 
 GROUNDING_RULE = (
@@ -183,32 +216,30 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     concierge_task = Task(
         description=(
             "Using the Place Scout's candidates and the Conditions Analyst's timing note, "
-            "call place_details on the 2-3 best-fitting candidates and write a final "
-            "recommendation for the traveler's request: {request} (target date: {target_date}). "
-            "Cite the quality score and, when available, the AI summary's sources for each "
-            "place you recommend. Do not recommend a place you didn't call place_details on.\n\n"
-            "If the traveler named one specific place, your entire answer should be about that "
-            "place only — do not mention, discuss, or explain why other candidates the Scout "
-            "found 'aren't recommended.' Only compare multiple places if the traveler's request "
-            "was genuinely open-ended (a vibe or category, not one named place).\n\n"
-            "You MUST include the Conditions Analyst's weather/outdoor-interest note in your "
-            "final answer, in your own words — every recommendation needs to say whether "
-            "conditions on {target_date} favor these places, not just describe the places "
-            "themselves. Do not omit this even if the rest of the answer is already long.\n\n"
+            "call place_details on the 2-3 best-fitting candidates for the traveler's request: "
+            "{request} (target date: {target_date}). Fill in each field from what place_details "
+            "actually returned — leave a field null rather than guessing if it wasn't available. "
+            "Do not recommend a place you didn't call place_details on.\n\n"
+            "If the traveler named one specific place, your `places` list should contain only "
+            "that place — do not pad it with other candidates the Scout found 'just in case.' "
+            "Only include multiple places if the traveler's request was genuinely open-ended "
+            "(a vibe or category, not one named place).\n\n"
+            "weather_summary must always be filled in from the Conditions Analyst's note — "
+            "never leave it empty.\n\n"
             "Traveler's starting point: {start_location}\n"
             "If a starting point was given (not 'not provided'), call travel_time_estimate on "
-            "each place you recommend and mention the estimated distance/travel time. If no "
-            "starting point was given, don't call travel_time_estimate and don't mention travel "
-            "time at all — say nothing rather than guessing a location."
+            "each place and fill in distance_km/walk_minutes/bike_minutes/travel_note from its "
+            "result. If no starting point was given, leave those four fields null — do not "
+            "guess a location."
         ),
         expected_output=(
-            "A final itinerary recommendation: 2-3 places with why each fits, their real "
-            "quality score, cited sources where available, the weather/outdoor-interest "
-            "conditions for the target date (always included, never omitted), and — only if a "
-            "starting point was given — an estimated travel time to each."
+            "A TripPlanOutput: each recommended place with its real quality score, sources, and "
+            "why it fits, a weather summary for the target date, and travel time fields filled "
+            "in only if a starting point was given."
         ),
         agent=concierge,
         context=[scout_task, conditions_task],
+        output_pydantic=TripPlanOutput,
     )
 
     return Crew(
@@ -219,7 +250,23 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     )
 
 
-def plan_trip(request: str, target_date: str, start_location: str = "", _retry_wait_s: int = 15) -> str:
+def _extract(crew_output) -> TripPlanOutput:
+    """crew_output.pydantic is populated when output_pydantic parsing
+    succeeds; falls back to wrapping the raw text in a single-field
+    TripPlanOutput if the model's final answer couldn't be coerced into the
+    schema — rare (instructor retries internally), but a fallback beats a
+    hard crash on an otherwise-successful crew run."""
+    if crew_output.pydantic is not None:
+        return crew_output.pydantic
+    log.warning("Concierge output didn't parse into TripPlanOutput, falling back to raw text")
+    return TripPlanOutput(
+        places=[],
+        weather_summary="",
+        overall_note=str(crew_output),
+    )
+
+
+def plan_trip(request: str, target_date: str, start_location: str = "", _retry_wait_s: int = 15) -> dict:
     """Retries once on a Groq TPM rate-limit hit — the free tier's ceiling
     sits close enough to this crew's per-run token usage that an occasional
     hit is expected, not exceptional (see GROQ_MODEL comment above).
@@ -228,7 +275,11 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
     not turned into its own agent tool call: the Concierge's
     travel_time_estimate tool reads the result via set_trip_start() instead
     of the agent having to geocode text itself, which would burn tokens on
-    every single run instead of once per request."""
+    every single run instead of once per request.
+
+    Returns a plain dict (TripPlanOutput.model_dump()), not the pydantic
+    object itself — keeps the FastAPI layer decoupled from this module's
+    internal schema class."""
     import litellm
 
     if start_location.strip():
@@ -247,20 +298,23 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
         "start_location": start_location.strip() or "not provided",
     }
     try:
-        return str(build_crew().kickoff(inputs=inputs))
+        result = _extract(build_crew().kickoff(inputs=inputs))
     except litellm.RateLimitError:
         time.sleep(_retry_wait_s)
-        return str(build_crew().kickoff(inputs=inputs))
+        result = _extract(build_crew().kickoff(inputs=inputs))
     except litellm.BadRequestError as e:
         # Occasional malformed tool-call generation (found live: Groq/Llama
         # sometimes emits <function=...></function> tags instead of proper
-        # JSON, which Groq's strict parser rejects as "tool_use_failed") —
-        # not a rate-limit issue, no cooldown needed, just retry once
-        # immediately. This is a different failure mode than the
-        # llama-3.1-8b-instant malformed-syntax issue noted above (that one
-        # was consistent enough to rule the model out entirely; this is an
-        # occasional glitch on the otherwise-reliable 70b model).
+        # JSON, or gets a tool's argument types wrong, which Groq's strict
+        # parser rejects as "tool_use_failed") — not a rate-limit issue, no
+        # cooldown needed, just retry once immediately. Different failure
+        # mode than the llama-3.1-8b-instant malformed-syntax issue noted
+        # above (that one was consistent enough to rule the model out
+        # entirely; this is an occasional glitch on the otherwise-reliable
+        # 70b model, not guaranteed to be fixed by one retry).
         if "tool_use_failed" not in str(e):
             raise
         log.warning(f"Malformed tool-call generation, retrying once: {e}")
-        return str(build_crew().kickoff(inputs=inputs))
+        result = _extract(build_crew().kickoff(inputs=inputs))
+
+    return result.model_dump()
