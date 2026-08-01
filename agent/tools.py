@@ -71,6 +71,27 @@ BIKE_KMH = 15.0
 WALK_MINUTES_LIMIT = 15
 
 
+def travel_fields(dist_km: float) -> dict:
+    """The actual walk/bike/note computation, shared by the live
+    travel_time_estimate tool below and agent/crew.py's trip-plan cache
+    (which recomputes these for a new starting point without re-running the
+    crew — pure math, zero LLM cost). Kept in one place so both stay
+    consistent instead of two copies drifting apart over time."""
+    walk_min = round(dist_km / WALK_KMH * 60)
+    bike_min = round(dist_km / BIKE_KMH * 60)
+    travel_note = (
+        "too far to walk comfortably, consider biking or transit"
+        if walk_min > WALK_MINUTES_LIMIT
+        else None
+    )
+    return {
+        "distance_km": round(dist_km, 2),
+        "walk_minutes": walk_min,
+        "bike_minutes": bike_min,
+        "travel_note": travel_note,
+    }
+
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -344,20 +365,19 @@ def travel_time_estimate(place_name: str) -> str:
     _, _, lat, lon = resolved
 
     dist_km = haversine_km(_trip_start["lat"], _trip_start["lon"], lat, lon)
-    walk_min = round(dist_km / WALK_KMH * 60)
-    bike_min = round(dist_km / BIKE_KMH * 60)
+    fields = travel_fields(dist_km)
 
-    if walk_min > WALK_MINUTES_LIMIT:
+    if fields["travel_note"]:
         return (
-            f"From {_trip_start['label']}: roughly {dist_km:.1f} km straight-line — "
-            f"that's too far to walk comfortably (~{walk_min} min). Biking is doable "
-            f"(~{bike_min} min). Otherwise, Copenhagen's Metro/S-train network covers "
-            f"most of the city well — worth checking a real route, since exact bus/train "
+            f"From {_trip_start['label']}: roughly {fields['distance_km']:.1f} km straight-line — "
+            f"that's {fields['travel_note']} (~{fields['walk_minutes']} min walk, "
+            f"~{fields['bike_minutes']} min bike). Otherwise, Copenhagen's Metro/S-train network "
+            f"covers most of the city well — worth checking a real route, since exact bus/train "
             f"lines aren't available here."
         )
     return (
-        f"From {_trip_start['label']}: roughly {dist_km:.1f} km straight-line, "
-        f"about {walk_min} min walking or {bike_min} min biking."
+        f"From {_trip_start['label']}: roughly {fields['distance_km']:.1f} km straight-line, "
+        f"about {fields['walk_minutes']} min walking or {fields['bike_minutes']} min biking."
     )
 
 

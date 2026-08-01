@@ -181,3 +181,21 @@ CREATE TABLE pipeline_runs (
     records_processed int,
     notes             text
 );
+
+-- Trip Planner result cache — saves real Groq tokens on repeat/near-repeat
+-- requests. Two ways a row gets reused, both zero LLM cost: (1) exact match
+-- on request+date+start_location within the TTL, return as-is; (2) same
+-- request+date but a DIFFERENT start_location — the places/weather don't
+-- depend on where the traveler starts from, so agent/crew.py recomputes
+-- just the travel-time fields with plain haversine math instead of
+-- re-running the crew. See plan_trip() in agent/crew.py.
+CREATE TABLE trip_plan_cache (
+    cache_id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_norm         text NOT NULL,
+    target_date          date NOT NULL,
+    start_location_norm  text NOT NULL DEFAULT '',
+    result_json          jsonb NOT NULL,
+    created_at           timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_trip_plan_cache_lookup ON trip_plan_cache (request_norm, target_date);

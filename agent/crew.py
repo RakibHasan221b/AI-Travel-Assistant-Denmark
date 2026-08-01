@@ -13,17 +13,20 @@ import os
 import sys
 import time
 
+import psycopg
 import requests
 from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from agent.tools import (
+    haversine_km,
     place_details,
     search_places,
     search_places_near,
     set_trip_start,
     top_quality_places,
+    travel_fields,
     travel_time_estimate,
     weather_conditions,
 )
@@ -306,6 +309,95 @@ def _extract(crew_output) -> TripPlanOutput:
     )
 
 
+# Rolling window, not a hard daily reset — real Groq usage today (heavy
+# live testing while building this crew) hit its own token cap, which is
+# exactly the problem this cache exists to reduce for normal use.
+CACHE_TTL_HOURS = 24
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+
+def _cache_connect():
+    return psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=15)
+
+
+def _get_exact_cache(request: str, target_date: str, start_location: str) -> dict | None:
+    """Exact match on request+date+start_location within CACHE_TTL_HOURS —
+    zero LLM cost on a hit. Real problem this fixes: re-submitting the same
+    question (a user re-clicking, or repeat testing while building this
+    feature) was spending real Groq tokens on an identical answer every
+    single time."""
+    with _cache_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT result_json FROM trip_plan_cache
+            WHERE request_norm = %s AND target_date = %s AND start_location_norm = %s
+              AND created_at > now() - interval '24 hours'
+            ORDER BY created_at DESC LIMIT 1;
+            """,
+            (_normalize(request), target_date, _normalize(start_location)),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _get_same_request_cache(request: str, target_date: str) -> dict | None:
+    """Same request+date, ANY start_location — used to adapt a cached plan
+    for a new starting point without re-running the crew. The places,
+    weather, and summary don't depend on where the traveler starts from;
+    only the travel-time fields do, and those are recomputable with plain
+    math (see _recompute_travel)."""
+    with _cache_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT result_json FROM trip_plan_cache
+            WHERE request_norm = %s AND target_date = %s
+              AND created_at > now() - interval '24 hours'
+            ORDER BY created_at DESC LIMIT 1;
+            """,
+            (_normalize(request), target_date),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _save_cache(request: str, target_date: str, start_location: str, result: dict) -> None:
+    with _cache_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO trip_plan_cache (request_norm, target_date, start_location_norm, result_json)
+            VALUES (%s, %s, %s, %s);
+            """,
+            (_normalize(request), target_date, _normalize(start_location), psycopg.types.json.Json(result)),
+        )
+        conn.commit()
+
+
+def _recompute_travel(result: dict, start_lat: float, start_lon: float, start_label: str) -> dict:
+    """Zero LLM cost: looks up each cached place's real coordinates and
+    recalculates distance/walk/bike time from a NEW starting point, reusing
+    travel_fields() so this stays consistent with the live tool's math and
+    thresholds. near_place/near_distance_km are untouched — those measure
+    distance to another recommended place, not to the traveler's start, so
+    a different starting point doesn't change them."""
+    with _cache_connect() as conn, conn.cursor() as cur:
+        for place in result.get("places", []):
+            cur.execute(
+                "SELECT lat, lon FROM places WHERE name ILIKE %(name)s "
+                "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
+                {"name": f"%{place['name']}%", "exact": place["name"]},
+            )
+            row = cur.fetchone()
+            if not row:
+                continue
+            dist_km = haversine_km(start_lat, start_lon, row[0], row[1])
+            place.update(travel_fields(dist_km))
+    log.info(f"Cache: reused places/weather for {start_label!r}, recomputed travel time with plain math")
+    return result
+
+
 def plan_trip(request: str, target_date: str, start_location: str = "", _retry_wait_s: int = 15) -> dict:
     """Retries once on a Groq TPM rate-limit hit — the free tier's ceiling
     sits close enough to this crew's per-run token usage that an occasional
@@ -317,15 +409,30 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
     of the agent having to geocode text itself, which would burn tokens on
     every single run instead of once per request.
 
+    Checks the cache before spending any tokens: an exact repeat returns
+    instantly; the same request+date with a different start_location
+    reuses the cached places/weather and only recomputes travel time
+    (pure math). Only a genuinely new request runs the real crew.
+
     Returns a plain dict (TripPlanOutput.model_dump()), not the pydantic
     object itself — keeps the FastAPI layer decoupled from this module's
     internal schema class."""
     import litellm
 
+    exact = _get_exact_cache(request, target_date, start_location)
+    if exact is not None:
+        log.info("Cache: exact match, zero LLM cost")
+        return exact
+
     if start_location.strip():
         coords = geocode(start_location)
         if coords:
             set_trip_start(coords[0], coords[1], start_location)
+            same_request = _get_same_request_cache(request, target_date)
+            if same_request is not None:
+                result = _recompute_travel(same_request, coords[0], coords[1], start_location)
+                _save_cache(request, target_date, start_location, result)
+                return result
         else:
             log.warning(f"Could not geocode start_location={start_location!r}, proceeding without it")
             set_trip_start(None, None, start_location)
@@ -338,10 +445,10 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
         "start_location": start_location.strip() or "not provided",
     }
     try:
-        result = _extract(build_crew().kickoff(inputs=inputs))
+        result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
     except litellm.RateLimitError:
         time.sleep(_retry_wait_s)
-        result = _extract(build_crew().kickoff(inputs=inputs))
+        result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
     except litellm.BadRequestError as e:
         # Occasional malformed tool-call generation (found live: Groq/Llama
         # sometimes emits <function=...></function> tags instead of proper
@@ -355,6 +462,8 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
         if "tool_use_failed" not in str(e):
             raise
         log.warning(f"Malformed tool-call generation, retrying once: {e}")
-        result = _extract(build_crew().kickoff(inputs=inputs))
+        result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
 
-    return result.model_dump()
+    _save_cache(request, target_date, start_location, result)
+
+    return result
