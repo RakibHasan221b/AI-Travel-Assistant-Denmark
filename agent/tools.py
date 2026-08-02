@@ -63,6 +63,16 @@ def set_trip_start(lat: float | None, lon: float | None, label: str) -> None:
     _trip_start["lat"], _trip_start["lon"], _trip_start["label"] = lat, lon, label
 
 
+# search_places_near always returned its closest N candidates regardless of
+# how far away "closest" actually was — fine when the nearest match is
+# genuinely close, but in a sparse area the "closest" cafe could still be
+# several km off, and returning it unqualified would call something "near"
+# that no traveler would call walkable. Capping the radius means the tool
+# can honestly say "nothing genuinely nearby" instead of quietly relabeling
+# "not that close" as "near."
+MAX_NEARBY_KM = 2.0
+
+
 # Average speeds used for the estimate, not a routed distance — deliberately
 # not a real transit API. Checked Rejseplanen (Denmark's official journey
 # planner, the "right" real data source here): it requires a manual
@@ -238,11 +248,14 @@ def search_places_near(anchor_place: str, category: str = "", limit: int | str =
     for r in rows:
         r["distance_km"] = haversine_km(anchor_lat, anchor_lon, r["lat"], r["lon"])
     rows.sort(key=lambda r: r["distance_km"])
-    rows = rows[:limit]
+    rows = [r for r in rows if r["distance_km"] <= MAX_NEARBY_KM][:limit]
 
     if not rows:
         scope = f" in category '{category}'" if category else ""
-        return f"No places found near {anchor_name}{scope}."
+        return (
+            f"No places found within {MAX_NEARBY_KM:.0f} km of {anchor_name}{scope} — "
+            "nothing genuinely nearby, say so honestly rather than suggesting somewhere far away."
+        )
     return "\n".join(
         f"- {r['name']} ({r['category']}, {r['neighborhood'] or 'unknown area'}), "
         f"{r['distance_km']:.2f} km from {anchor_name}, hours: {r['opening_hours'] or 'unknown'}"

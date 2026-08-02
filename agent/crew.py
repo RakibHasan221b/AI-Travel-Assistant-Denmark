@@ -96,6 +96,17 @@ def geocode(text: str) -> tuple[float, float] | None:
         return None
 
 
+# place_details() (agent/tools.py) uses filler words like "unknown" /
+# "unclustered" / "not available (...)" so its text reads naturally for the
+# LLM to consume — but see PlaceRecommendation's validator below for why
+# these exact strings matter as a module-level constant, not a class attr.
+_PLACEHOLDER_VALUES = {
+    "unknown",
+    "unclustered",
+    "not available (no linked review text for this place).",
+}
+
+
 class PlaceRecommendation(BaseModel):
     name: str
     category: str
@@ -137,6 +148,25 @@ class PlaceRecommendation(BaseModel):
         # at the one point the model's actual (if technically wrong) output
         # can still be repaired instead of hoping the prompt fixes it.
         return v if v is not None else []
+
+    # Found live: place_details() (agent/tools.py) uses filler words like
+    # "unknown"/"unclustered"/"not available (...)" so the TEXT it hands the
+    # LLM reads naturally — but the Concierge sometimes copies that filler
+    # word verbatim into the structured field instead of leaving it null,
+    # so "Opening hours: unknown" became the literal string the traveler
+    # saw, and "not available (no linked review text for this place)."
+    # rendered as if it were a real summary. Since these UI fields are
+    # already built to hide themselves entirely when null (no "Hours:
+    # unknown" line at all), coercing the filler text back to null fixes
+    # the display for free — no frontend change needed. (_PLACEHOLDER_VALUES
+    # lives at module level, not as a class attribute — Pydantic intercepts
+    # underscore-prefixed class attributes as private model fields.)
+    @field_validator("opening_hours", "vibe_cluster", "summary", mode="before")
+    @classmethod
+    def _coerce_placeholder_text_to_null(cls, v):
+        if isinstance(v, str) and v.strip().lower() in _PLACEHOLDER_VALUES:
+            return None
+        return v
 
 
 class TripPlanOutput(BaseModel):
@@ -278,8 +308,15 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "EXCEPTION: if the Scout found a place only via search_place_live (a live lookup, not "
             "our dataset), do NOT call place_details on it — it isn't in the database and that call "
             "would just fail. Instead use exactly what the Scout's live-lookup result said (name, "
-            "address), leave quality_score/vibe_cluster/summary/sources all null, and make "
-            "why_recommended state plainly that this place isn't in our curated, scored dataset.\n\n"
+            "address), and leave quality_score/vibe_cluster/summary/sources all null — the null "
+            "fields already make this honest on their own (the app simply won't show a score/vibe/"
+            "summary that isn't there), so do not also explain this in why_recommended.\n\n"
+            "why_recommended and overall_note must read like a real concierge talking to a traveler, "
+            "not like a system describing itself. Never mention how a place was found (a tool name, "
+            "'live lookup', 'our database'), and never comment on what data is or isn't available "
+            "('hours are known', 'no info for this one', 'not in our dataset'). If something is "
+            "missing, the honest move is to simply not mention it — not to announce that it's "
+            "missing.\n\n"
             "If the Scout's notes say a place was found via search_places_near (they'll mention a "
             "real distance like '0.32 km from Den lille Havfrue'), set near_place to that other "
             "place's name and near_distance_km to that exact number from the Scout's notes — do "

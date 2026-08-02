@@ -74,3 +74,37 @@ def test_trip_plan_output_survives_multiple_places_with_null_sources():
     ]
     output = TripPlanOutput(places=places, weather_summary="sunny")
     assert all(p.sources == [] for p in output.places)
+
+
+def test_place_recommendation_coerces_placeholder_filler_text_to_null():
+    # Real bug found live: place_details() (agent/tools.py) uses filler
+    # words like "unknown"/"unclustered"/"not available (...)" so its TEXT
+    # reads naturally for the LLM — but the Concierge copied that filler
+    # text verbatim into the structured fields instead of leaving them
+    # null, so travelers literally saw "Hours: unknown" and a summary that
+    # just said "not available (no linked review text for this place)."
+    place = PlaceRecommendation(
+        name="Test",
+        category="cafe",
+        opening_hours="unknown",
+        vibe_cluster="unclustered",
+        summary="not available (no linked review text for this place).",
+        why_recommended="test",
+    )
+    assert place.opening_hours is None
+    assert place.vibe_cluster is None
+    assert place.summary is None
+
+
+def test_place_recommendation_keeps_real_values_matching_placeholder_case_insensitively():
+    # Guards against the coercion being too aggressive/case-sensitive in
+    # either direction.
+    place = PlaceRecommendation(
+        name="Test", category="cafe", opening_hours="UNKNOWN", why_recommended="test"
+    )
+    assert place.opening_hours is None
+
+    place2 = PlaceRecommendation(
+        name="Test2", category="cafe", opening_hours="Mo-Fr 08:00-18:00", why_recommended="test"
+    )
+    assert place2.opening_hours == "Mo-Fr 08:00-18:00"
