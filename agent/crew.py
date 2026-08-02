@@ -17,7 +17,7 @@ import psycopg
 import requests
 from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent.tools import (
     haversine_km,
@@ -125,6 +125,18 @@ class PlaceRecommendation(BaseModel):
         "traveler's own starting point, not from another recommended place. Null if near_place is null.",
     )
     why_recommended: str = Field(description="1-2 sentences on why this place fits the request")
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def _coerce_null_sources(cls, v):
+        # Found live: Groq/Llama sometimes emits `"sources": null` for a
+        # place with no cited sources, instead of `[]` — `default_factory`
+        # only fills in a genuinely *missing* key, not an explicit null, so
+        # this crashed the whole trip plan with a real ValidationError.
+        # Same category of fix as _coerce_limit in agent/tools.py: coerce
+        # at the one point the model's actual (if technically wrong) output
+        # can still be repaired instead of hoping the prompt fixes it.
+        return v if v is not None else []
 
 
 class TripPlanOutput(BaseModel):
