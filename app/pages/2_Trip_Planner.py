@@ -39,9 +39,8 @@ COPENHAGEN_TODAY = datetime.now(ZoneInfo("Europe/Copenhagen")).date()
 st.set_page_config(page_title="Trip Planner — AI Denmark Explorer", page_icon="🗺️", layout="centered")
 st.title("🗺️ Trip Planner")
 st.caption(
-    "Three agents collaborate on this: a Place Scout finds candidates, a Conditions Analyst "
-    "checks real weather, and a Concierge writes the final recommendation grounded in what "
-    "the other two actually found."
+    "Two agents collaborate on this: a Place Scout finds candidates, and a Concierge checks "
+    "real weather and writes the final recommendation grounded in what the Scout actually found."
 )
 
 if "trip_plan_result" not in st.session_state:

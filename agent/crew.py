@@ -1,6 +1,16 @@
-"""Phase 11 — CrewAI trip-planning crew: three genuinely separate jobs
-(finding places, checking timing/conditions, synthesizing a recommendation)
-rather than one tool-calling loop. See docs/architecture.md.
+"""Phase 11 — CrewAI trip-planning crew: two genuinely separate jobs
+(finding places, synthesizing a recommendation) rather than one
+tool-calling loop. See docs/architecture.md.
+
+Weather/conditions used to be a third agent (Conditions Analyst) with its
+own task. Folded into the Concierge as one more tool call instead — its
+whole job was "call weather_conditions once, summarize it," which doesn't
+need a dedicated reasoning agent, and every separate agent CrewAI hands
+off to pays a real, measured fixed cost (its own backstory + task
+description + a fresh opening LLM call) before it does any real work.
+Found live: that fixed cost was ~1,400-1,600 tokens per run for a task
+this small — cutting it directly reduces every single run's token bill,
+not just repeated ones.
 
 LLM is Groq (llama-3.3-70b-versatile), not GPT-4o — GPT-4o stays scoped to
 Phase 8's RAG summaries per this project's ML/rules-before-LLM-calls
@@ -218,29 +228,17 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
         verbose=True,
     )
 
-    conditions_analyst = Agent(
-        role="Conditions Analyst",
-        goal="Assess weather and timing so the trip plan fits real conditions, not assumptions.",
-        backstory=(
-            "You check real weather and the Outdoor Interest Index before anyone commits "
-            "to an itinerary. " + GROUNDING_RULE
-        ),
-        tools=[weather_conditions],
-        llm=llm,
-        max_iter=MAX_AGENT_ITER,
-        verbose=True,
-    )
-
     concierge = Agent(
         role="Concierge",
-        goal="Turn the scouted places and conditions into one honest, specific recommendation.",
+        goal="Turn the scouted places and real conditions into one honest, specific recommendation.",
         backstory=(
             "You write the final answer a traveler actually reads. You pull rich detail "
             "(quality score, vibe cluster, rated aspects, AI summary with sources) for "
-            "each place you recommend, and you never oversell a place with thin evidence. "
-            + GROUNDING_RULE
+            "each place you recommend, check real weather and the Outdoor Interest Index "
+            "before anyone commits to an itinerary, and you never oversell a place with "
+            "thin evidence. " + GROUNDING_RULE
         ),
-        tools=[place_details, travel_time_estimate],
+        tools=[place_details, travel_time_estimate, weather_conditions],
         llm=llm,
         max_iter=MAX_AGENT_ITER,
         verbose=True,
@@ -288,25 +286,16 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
         agent=place_scout,
     )
 
-    conditions_task = Task(
-        description=(
-            "Target date: {target_date}\n\n"
-            "Check weather and outdoor-interest conditions for that date using "
-            "weather_conditions — call it once, then report your finding immediately, don't "
-            "re-call it to double-check. If the date is out of the stored range, report that "
-            "plainly instead of guessing."
-        ),
-        expected_output="A short note on weather and whether conditions favor outdoor/indoor places.",
-        agent=conditions_analyst,
-    )
-
     concierge_task = Task(
         description=(
             "IMPORTANT: never call the same tool with the same arguments twice — one batched "
-            "place_details call and one batched travel_time_estimate call (if a start location was "
-            "given) is enough; the moment you have those results, stop calling tools and write your "
-            "final answer.\n\n"
-            "Using the Place Scout's candidates and the Conditions Analyst's timing note, call "
+            "place_details call, one weather_conditions call, and one batched travel_time_estimate "
+            "call (if a start location was given) is enough; the moment you have those results, stop "
+            "calling tools and write your final answer.\n\n"
+            "Call weather_conditions once for target date {target_date} to get real weather and "
+            "outdoor-interest conditions — if the date is out of the stored range, report that "
+            "plainly in weather_summary instead of guessing.\n\n"
+            "Using the Place Scout's candidates, call "
             "place_details ONCE with every place the Scout returned, comma-separated, for: "
             "{request} (target date: {target_date}) — never call place_details separately per "
             "place, that wastes tokens and risks a rate limit. If the Scout covered multiple parts "
@@ -325,9 +314,9 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "If the Scout noted a real search_places_near distance (e.g. '0.32 km from X'), set "
             "near_place and near_distance_km to that exact value — never invent or round it. Null "
             "for places found any other way.\n\n"
-            "weather_summary must always come from the Conditions Analyst's note. overall_note: "
-            "required, 2-4 sentences tying the recommendation together like a real concierge "
-            "speaking — never empty.\n\n"
+            "weather_summary: required, 1-2 sentences from your own weather_conditions call. "
+            "overall_note: required, 2-4 sentences tying the recommendation together like a real "
+            "concierge speaking — never empty.\n\n"
             "Traveler's starting point: {start_location}. If given (not 'not provided'), call "
             "travel_time_estimate ONCE with every place name comma-separated (same rule as "
             "place_details — one call, not one per place) and fill distance_km/walk_minutes/"
@@ -342,13 +331,13 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "recommendation together."
         ),
         agent=concierge,
-        context=[scout_task, conditions_task],
+        context=[scout_task],
         output_pydantic=TripPlanOutput,
     )
 
     return Crew(
-        agents=[place_scout, conditions_analyst, concierge],
-        tasks=[scout_task, conditions_task, concierge_task],
+        agents=[place_scout, concierge],
+        tasks=[scout_task, concierge_task],
         process=Process.sequential,
         verbose=True,
     )

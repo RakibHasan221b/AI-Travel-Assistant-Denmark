@@ -8,7 +8,7 @@ import { useEffect, useState } from "react";
 // this project's honesty-over-confidence principle elsewhere.
 function stageCopy(elapsedSeconds: number): string {
   if (elapsedSeconds < 20) return "Place Scout is searching the database for candidates…";
-  if (elapsedSeconds < 50) return "Conditions Analyst is checking Copenhagen's weather…";
+  if (elapsedSeconds < 50) return "Concierge is checking weather and pulling place details…";
   return "Concierge is writing your recommendation…";
 }
 

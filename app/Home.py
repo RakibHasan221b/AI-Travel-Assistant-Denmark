@@ -14,7 +14,7 @@ st.markdown(
 Use the sidebar to navigate:
 
 - **Explore** — semantic search over 1,468 real Copenhagen places (pgvector), with quality scores, vibe clusters, and AI-grounded summaries where available.
-- **Trip Planner** — a CrewAI multi-agent crew (Place Scout, Conditions Analyst, Concierge) plans a real recommendation from your request.
+- **Trip Planner** — a CrewAI multi-agent crew (Place Scout, Concierge) plans a real recommendation from your request.
 - **Stats Dashboard** — aggregate numbers computed straight from Postgres: quality scores by neighborhood, cluster sizes, sentiment distribution, weather-driven forecasts.
 """
 )

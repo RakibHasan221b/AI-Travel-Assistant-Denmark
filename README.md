@@ -16,7 +16,7 @@ the actively-developed one; Streamlit stays live alongside it.
 ## What it does
 
 - **Explore** — semantic ("vibe") search over 1,896 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
-- **Trip Planner** — three [CrewAI](https://www.crewai.com/) agents (Place Scout, Conditions Analyst, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite. A live-lookup fallback (Nominatim) honestly flags any place outside the curated, scored dataset instead of pretending it has the same evidence behind it. Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
+- **Trip Planner** — two [CrewAI](https://www.crewai.com/) agents (Place Scout, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite. A live-lookup fallback (Nominatim) honestly flags any place outside the curated, scored dataset instead of pretending it has the same evidence behind it. Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
 - **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts.
 
 ## Key results
@@ -63,7 +63,7 @@ See [`docs/technique_map.md`](docs/technique_map.md) for the full technique-to-i
 | 8 | RAG-grounded summaries | done — 177 places summarized via pgvector retrieval + GPT-4o (LangChain), sources cited per summary |
 | 9 | Quality-score model bake-off | done — XGBoost won (RMSE 8.76, R² 0.12, 83% within ±10pts) vs RF/Linear/NN, Optuna-tuned, MLflow-tracked, scores stored for all 1,896 places |
 | 10 | Weather-aware time series | done — real Open-Meteo weather + confirmed Copenhagen event dates, chronological split (RMSE 3.39, R² 0.98, 97% within ±10pts), 5,688 place-day forecasts |
-| 11 | CrewAI trip-planning crew + API | done — Place Scout / Conditions Analyst / Concierge (Groq llama-3.3-70b), thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
+| 11 | CrewAI trip-planning crew + API | done — Place Scout / Concierge (Groq llama-3.3-70b), thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
 | 12 | Deployment | **live** — API on Render, app on Streamlit Community Cloud. See `docs/deployment_troubleshooting.md` for the real debugging story |
 | 13 | Portfolio write-up | this README, plus a CV/LinkedIn version |
 | 14 | React/Next.js/TypeScript frontend | **live** — all three pages (Explore, Trip Planner, Stats Dashboard) rebuilt in Next.js (App Router, TypeScript, Tailwind, Recharts), deployed on Vercel, calling the same FastAPI backend directly from the browser |

@@ -50,10 +50,14 @@ OSM, Wikivoyage, opendata.dk, and the seed review set.
 
 ## Agent orchestration: CrewAI, not a single LangChain agent
 
-The Phase 11 trip planner is naturally three distinct jobs — finding places,
-checking timing/conditions, and synthesizing a recommendation — so it's built
-as a CrewAI crew (Place Scout, Conditions Analyst, Concierge) rather than one
-tool-calling loop.
+The Phase 11 trip planner is built as a CrewAI crew (Place Scout, Concierge)
+rather than one tool-calling loop. A third agent (Conditions Analyst) existed
+early on to check weather/timing, but got folded into the Concierge as one
+more tool call — its whole job was "call weather_conditions once, summarize
+it," which doesn't need a dedicated reasoning agent, and every separate
+agent CrewAI hands off to pays a real, measured fixed cost (its own
+backstory + task description + a fresh opening LLM call) before doing any
+real work — found live, ~1,400-1,600 tokens per run for a task that small.
 
 Correction to the original plan: this doc originally said CrewAI's tools
 would be LangChain-wrapped, on the assumption that CrewAI ran on LangChain
@@ -66,12 +70,17 @@ tools (`agent/tools.py`) are built with `crewai.tools.tool`, and the LLM
 `langchain-groq`. LangChain's one real, verified use in this project remains
 Phase 8's RAG chain — Phase 11 doesn't use it at all.
 
-Two real bugs were hit and worked around getting the Groq-backed crew
-working, both documented inline in `agent/crew.py`: crewai 1.15.8 tags every
-LLM message with an Anthropic-specific prompt-caching marker that's never
+Several real bugs were hit and fixed getting the Groq-backed crew working,
+all documented inline in `agent/crew.py`: crewai 1.15.8 tags every LLM
+message with an Anthropic-specific prompt-caching marker that's never
 actually stripped for other providers (a genuine gap in the installed
 package, confirmed by grepping its source — patched with a no-op monkeypatch
-of `mark_cache_breakpoint`), and `llama-3.3-70b-versatile`'s free-tier Groq
-rate limit (12,000 TPM) sits close enough to a full 3-agent run's token
-usage that occasional rate-limit hits are expected, not exceptional — handled
-with a bounded retry in `plan_trip()` rather than pretending it won't happen.
+of `mark_cache_breakpoint`); the Place Scout could get stuck repeating the
+exact same tool calls with identical arguments instead of recognizing it
+already had its answer, found live burning ~12,000 tokens on a task that
+needed one round of tool calls — fixed with an explicit stop-once-you-have-
+results instruction; and `plan_trip()` no longer retries a rate-limit hit at
+all, since a retry means re-running the whole crew from scratch, and on a
+free tier this tight (12,000 TPM / 100,000 TPD) that's gambling a full run's
+worth of tokens on a coin-flip rather than failing fast and letting a real
+click try again.
