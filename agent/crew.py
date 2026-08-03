@@ -297,41 +297,29 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     concierge_task = Task(
         description=(
             "Using the Place Scout's candidates and the Conditions Analyst's timing note, "
-            "call place_details on EVERY place the Scout returned for the traveler's request: "
-            "{request} (target date: {target_date}) — not just the single best one. If the Scout "
-            "covered more than one part of the request (e.g. a named place AND an open-ended "
-            "category), your `places` list must include a result for each part; do not collapse "
-            "it down to only one place. Fill in name/category/neighborhood/opening_hours/"
-            "quality_score/vibe_cluster/summary/sources from what place_details actually returned "
-            "— leave a field null rather than guessing if it wasn't available. Do not recommend a "
-            "place you didn't call place_details on.\n\n"
-            "EXCEPTION: if the Scout found a place only via search_place_live (a live lookup, not "
-            "our dataset), do NOT call place_details on it — it isn't in the database and that call "
-            "would just fail. Instead use exactly what the Scout's live-lookup result said (name, "
-            "address), and leave quality_score/vibe_cluster/summary/sources all null — the null "
-            "fields already make this honest on their own (the app simply won't show a score/vibe/"
-            "summary that isn't there), so do not also explain this in why_recommended.\n\n"
-            "why_recommended and overall_note must read like a real concierge talking to a traveler, "
-            "not like a system describing itself. Never mention how a place was found (a tool name, "
-            "'live lookup', 'our database'), and never comment on what data is or isn't available "
-            "('hours are known', 'no info for this one', 'not in our dataset'). If something is "
-            "missing, the honest move is to simply not mention it — not to announce that it's "
-            "missing.\n\n"
-            "If the Scout's notes say a place was found via search_places_near (they'll mention a "
-            "real distance like '0.32 km from Den lille Havfrue'), set near_place to that other "
-            "place's name and near_distance_km to that exact number from the Scout's notes — do "
-            "not invent or round it. Leave both null for places found any other way.\n\n"
-            "weather_summary must always be filled in from the Conditions Analyst's note — "
-            "never leave it empty.\n\n"
-            "overall_note: write 2-4 sentences that tie the whole recommendation together like a "
-            "real travel concierge would say out loud — not a leftover caveat field. Mention how "
-            "the places relate to each other or to the day's conditions, and give a genuine "
-            "closing recommendation. This is required, not optional — never leave it empty.\n\n"
-            "Traveler's starting point: {start_location}\n"
-            "If a starting point was given (not 'not provided'), call travel_time_estimate on "
-            "each place and fill in distance_km/walk_minutes/bike_minutes/travel_note from its "
-            "result. If no starting point was given, leave those four fields null — do not "
-            "guess a location."
+            "call place_details on EVERY place the Scout returned for: {request} (target date: "
+            "{target_date}) — not just the best one. If the Scout covered multiple parts of the "
+            "request, include a result for each; don't collapse to one place. Fill name/category/"
+            "neighborhood/opening_hours/quality_score/vibe_cluster/summary/sources from "
+            "place_details' actual output — null if unavailable, never guessed. Don't recommend "
+            "a place you didn't call place_details on.\n\n"
+            "EXCEPTION: for a place the Scout found only via search_place_live, skip place_details "
+            "(it isn't in the database) — use the live-lookup result as-is, leave quality_score/"
+            "vibe_cluster/summary/sources null.\n\n"
+            "why_recommended and overall_note must sound like a real concierge talking to a "
+            "traveler, not a system describing itself: never mention how a place was found (a "
+            "tool, 'live lookup', 'our database'), and never comment on what data is/isn't "
+            "available ('hours are known', 'not in our dataset'). Missing means simply not "
+            "mentioning it, not announcing the gap.\n\n"
+            "If the Scout noted a real search_places_near distance (e.g. '0.32 km from X'), set "
+            "near_place and near_distance_km to that exact value — never invent or round it. Null "
+            "for places found any other way.\n\n"
+            "weather_summary must always come from the Conditions Analyst's note. overall_note: "
+            "required, 2-4 sentences tying the recommendation together like a real concierge "
+            "speaking — never empty.\n\n"
+            "Traveler's starting point: {start_location}. If given (not 'not provided'), call "
+            "travel_time_estimate per place and fill distance_km/walk_minutes/bike_minutes/"
+            "travel_note. If not given, leave those four null — never guess a location."
         ),
         expected_output=(
             "A TripPlanOutput: every place the Scout found (not just one, unless the Scout only "
@@ -459,10 +447,22 @@ def _recompute_travel(result: dict, start_lat: float, start_lon: float, start_la
     return result
 
 
+MAX_RATE_LIMIT_RETRIES = 2
+
+
 def plan_trip(request: str, target_date: str, start_location: str = "", _retry_wait_s: int = 15) -> dict:
-    """Retries once on a Groq TPM rate-limit hit — the free tier's ceiling
-    sits close enough to this crew's per-run token usage that an occasional
-    hit is expected, not exceptional (see GROQ_MODEL comment above).
+    """Retries up to MAX_RATE_LIMIT_RETRIES times on a Groq TPM rate-limit
+    hit — the free tier's ceiling sits close enough to this crew's per-run
+    token usage that a hit is expected, not exceptional (see GROQ_MODEL
+    comment above). Found live: a SINGLE retry wasn't enough — a request
+    that used 91% of the per-minute budget (10,869/12,000 tokens) can still
+    be close enough to the ceiling that a retry attempt hits it again, and
+    the old code had no exception handling around that retry at all, so a
+    second hit propagated straight to the user as a raw, unhandled error —
+    exactly the "keep running it and it keeps failing" experience this
+    fixes. Backoff increases each attempt (15s, 30s) since a flat wait
+    doesn't account for how close to the ceiling the previous attempt left
+    things.
 
     start_location is geocoded once here (zero LLM cost — plain HTTP call),
     not turned into its own agent tool call: the Concierge's
@@ -508,8 +508,22 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
     try:
         result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
     except litellm.RateLimitError:
-        time.sleep(_retry_wait_s)
-        result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
+        result = None
+        last_error = None
+        for attempt in range(MAX_RATE_LIMIT_RETRIES):
+            wait_s = _retry_wait_s * (attempt + 1)
+            log.warning(
+                f"Groq TPM rate limit hit, retry {attempt + 1}/{MAX_RATE_LIMIT_RETRIES} "
+                f"after {wait_s}s"
+            )
+            time.sleep(wait_s)
+            try:
+                result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
+                break
+            except litellm.RateLimitError as e:
+                last_error = e
+        if result is None:
+            raise last_error
     except litellm.BadRequestError as e:
         # Occasional malformed tool-call generation (found live: Groq/Llama
         # sometimes emits <function=...></function> tags instead of proper

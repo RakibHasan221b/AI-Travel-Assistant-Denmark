@@ -282,16 +282,11 @@ def _respect_nominatim_rate_limit() -> None:
 
 @tool
 def search_place_live(query: str) -> str:
-    """Looks up a real place by name via a live OpenStreetMap/Nominatim
-    search — use this ONLY after search_places, search_places_near, and
-    top_quality_places all found nothing for a named place the traveler
-    asked about. This checks whether the place genuinely exists in
-    Copenhagen even though it isn't in our curated dataset.
-
-    A result from this tool has NO quality score, vibe cluster, or AI
-    summary — it was never scored or evaluated. Say so plainly if you use
-    it; never present it with the same confidence as a place found by the
-    other tools."""
+    """Last-resort live lookup for a named place — use ONLY after
+    search_places, search_places_near, and top_quality_places all found
+    nothing. Result has NO quality score, vibe cluster, or AI summary —
+    it's outside the curated dataset. Never present it with the same
+    confidence as a normal result."""
     _respect_nominatim_rate_limit()
     try:
         resp = requests.get(
