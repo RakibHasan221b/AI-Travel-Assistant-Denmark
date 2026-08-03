@@ -102,11 +102,6 @@ def _rate_limit_error(message="rate limited"):
     return litellm.RateLimitError(message=message, llm_provider="groq", model="llama-3.3-70b-versatile")
 
 
-class _FakeCrewOutput:
-    def __init__(self, pydantic_result):
-        self.pydantic = pydantic_result
-
-
 class _FakeCrew:
     def __init__(self, kickoff_fn):
         self._kickoff_fn = kickoff_fn
@@ -115,71 +110,16 @@ class _FakeCrew:
         return self._kickoff_fn()
 
 
-def _fake_output():
-    return _FakeCrewOutput(
-        TripPlanOutput(places=[], weather_summary="sunny", overall_note="ok")
-    )
-
-
-def test_plan_trip_retries_and_succeeds_on_the_second_attempt(monkeypatch):
-    # Real failure found live: a SINGLE retry (the old behavior) wasn't
-    # always enough — this confirms a second retry can still rescue a run
-    # that fails once after the first retry.
+def test_plan_trip_never_retries_a_rate_limit_hit(monkeypatch):
+    # A retry here means re-running the ENTIRE 3-agent crew, not just the
+    # failed call — on a tight free-tier budget, an automatic retry gambles
+    # a full run's worth of tokens on a coin-flip, and losing that gamble
+    # can burn a large chunk of the day's quota from one user click.
+    # Confirms build_crew is called exactly once, with no retry, regardless
+    # of whether the hit was a per-minute (TPM) or per-day (TPD) limit —
+    # Groq raises the identical litellm.RateLimitError for both.
     monkeypatch.setattr(crew_module, "_get_exact_cache", lambda *a, **k: None)
     monkeypatch.setattr(crew_module, "_save_cache", lambda *a, **k: None)
-    monkeypatch.setattr(crew_module.time, "sleep", lambda *a, **k: None)
-
-    calls = {"n": 0}
-
-    def kickoff_fn():
-        calls["n"] += 1
-        if calls["n"] < 3:  # fails on the initial attempt AND the first retry
-            raise _rate_limit_error()
-        return _fake_output()
-
-    monkeypatch.setattr(crew_module, "build_crew", lambda: _FakeCrew(kickoff_fn))
-
-    result = crew_module.plan_trip("test request", "2026-01-01")
-    assert result["weather_summary"] == "sunny"
-    assert calls["n"] == 3
-
-
-def test_plan_trip_raises_after_exhausting_all_retries(monkeypatch):
-    # Confirms retries are bounded, not infinite — a persistent rate limit
-    # still surfaces as a real error instead of hanging or silently eating it.
-    monkeypatch.setattr(crew_module, "_get_exact_cache", lambda *a, **k: None)
-    monkeypatch.setattr(crew_module, "_save_cache", lambda *a, **k: None)
-    monkeypatch.setattr(crew_module.time, "sleep", lambda *a, **k: None)
-
-    calls = {"n": 0}
-
-    def kickoff_fn():
-        calls["n"] += 1
-        raise _rate_limit_error()
-
-    monkeypatch.setattr(crew_module, "build_crew", lambda: _FakeCrew(kickoff_fn))
-
-    try:
-        crew_module.plan_trip("test request", "2026-01-01")
-        assert False, "expected RateLimitError to propagate"
-    except litellm.RateLimitError:
-        pass
-    # 1 initial attempt + MAX_RATE_LIMIT_RETRIES retries
-    assert calls["n"] == 1 + crew_module.MAX_RATE_LIMIT_RETRIES
-
-
-def test_plan_trip_fails_fast_on_a_daily_quota_hit_instead_of_retrying(monkeypatch):
-    # Real failure found live: Groq raises the exact same litellm.RateLimitError
-    # for a TPM (per-minute) hit AND a TPD (per-day) hit — only the message
-    # text differs. A TPD hit's own message said "try again in 26m57s"; the
-    # 15s/30s backoff built for a TPM hit can't possibly clear that, so
-    # retrying just makes the user wait through two guaranteed failures
-    # before the real error surfaces anyway. Confirms build_crew is only
-    # ever called once (no wasted retries) and time.sleep is never called.
-    monkeypatch.setattr(crew_module, "_get_exact_cache", lambda *a, **k: None)
-    monkeypatch.setattr(crew_module, "_save_cache", lambda *a, **k: None)
-    slept = {"called": False}
-    monkeypatch.setattr(crew_module.time, "sleep", lambda *a, **k: slept.__setitem__("called", True))
 
     calls = {"n": 0}
 
@@ -198,7 +138,6 @@ def test_plan_trip_fails_fast_on_a_daily_quota_hit_instead_of_retrying(monkeypat
     except litellm.RateLimitError:
         pass
     assert calls["n"] == 1
-    assert slept["called"] is False
 
 
 def test_place_recommendation_keeps_real_values_matching_placeholder_case_insensitively():

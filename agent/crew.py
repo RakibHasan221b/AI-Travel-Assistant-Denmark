@@ -11,7 +11,6 @@ prefix, reading GROQ_API_KEY from the environment.
 import logging
 import os
 import sys
-import time
 
 import psycopg
 import requests
@@ -460,22 +459,19 @@ def _recompute_travel(result: dict, start_lat: float, start_lon: float, start_la
     return result
 
 
-MAX_RATE_LIMIT_RETRIES = 2
-
-
-def plan_trip(request: str, target_date: str, start_location: str = "", _retry_wait_s: int = 15) -> dict:
-    """Retries up to MAX_RATE_LIMIT_RETRIES times on a Groq TPM rate-limit
-    hit — the free tier's ceiling sits close enough to this crew's per-run
-    token usage that a hit is expected, not exceptional (see GROQ_MODEL
-    comment above). Found live: a SINGLE retry wasn't enough — a request
-    that used 91% of the per-minute budget (10,869/12,000 tokens) can still
-    be close enough to the ceiling that a retry attempt hits it again, and
-    the old code had no exception handling around that retry at all, so a
-    second hit propagated straight to the user as a raw, unhandled error —
-    exactly the "keep running it and it keeps failing" experience this
-    fixes. Backoff increases each attempt (15s, 30s) since a flat wait
-    doesn't account for how close to the ceiling the previous attempt left
-    things.
+def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
+    """Never retries a Groq rate-limit hit (TPM or TPD — Groq raises the
+    identical litellm.RateLimitError for both). A retry here means re-running
+    the ENTIRE 3-agent crew from scratch, not just the one failed call — so
+    on a free tier this tight (12,000 TPM / 100,000 TPD), an automatic retry
+    is gambling a full run's worth of tokens on a coin-flip, and losing that
+    gamble can burn a quarter of the day's entire budget from a single user
+    click. That trade only made sense while a real bug (see agent/tools.py's
+    batching and the anti-loop task instructions below) was pushing every
+    run right up against the ceiling; with that fixed, a clean run should
+    fit comfortably, and a genuine rate-limit hit is now the exception, not
+    the norm — worth failing fast and letting a human decide to click again,
+    not worth spending another full run chasing it automatically.
 
     start_location is geocoded once here (zero LLM cost — plain HTTP call),
     not turned into its own agent tool call: the Concierge's
@@ -521,34 +517,8 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
     try:
         result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
     except litellm.RateLimitError as e:
-        # Found live: Groq enforces two separate ceilings — TPM (tokens per
-        # minute) AND TPD (tokens per day) — and raises the exact same
-        # litellm.RateLimitError for both, distinguishable only by the
-        # message text. The backoff below (15s, 30s) is sized for a TPM hit,
-        # which genuinely clears within a minute; a TPD hit's real message
-        # says "try again in 26m57s" — no amount of short retrying can ever
-        # succeed, so retrying anyway just makes the user wait through two
-        # guaranteed failures before the real error surfaces. Fail fast
-        # instead when it's a daily hit.
-        if "tokens per day" in str(e).lower():
-            log.warning(f"Groq daily token quota exhausted, not retrying (needs minutes, not seconds): {e}")
-            raise
-        result = None
-        last_error = None
-        for attempt in range(MAX_RATE_LIMIT_RETRIES):
-            wait_s = _retry_wait_s * (attempt + 1)
-            log.warning(
-                f"Groq TPM rate limit hit, retry {attempt + 1}/{MAX_RATE_LIMIT_RETRIES} "
-                f"after {wait_s}s"
-            )
-            time.sleep(wait_s)
-            try:
-                result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
-                break
-            except litellm.RateLimitError as e:
-                last_error = e
-        if result is None:
-            raise last_error
+        log.warning(f"Groq rate limit hit, not retrying (a retry re-runs the whole crew): {e}")
+        raise
     except litellm.BadRequestError as e:
         # Occasional malformed tool-call generation (found live: Groq/Llama
         # sometimes emits <function=...></function> tags instead of proper
