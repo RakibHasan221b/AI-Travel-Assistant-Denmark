@@ -1,7 +1,6 @@
 """Needs the isolated 'agent' venv (crewai) — see README's Phase 11 setup note."""
 
 import sys
-import time
 from pathlib import Path
 
 import litellm
