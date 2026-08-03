@@ -50,8 +50,25 @@ def test_weather_conditions_rejects_unparsable_date_without_hitting_the_network(
 
 def test_travel_time_estimate_without_a_start_point_says_so_without_hitting_the_network():
     set_trip_start(None, None, "")
-    result = travel_time_estimate.run(place_name="Den lille Havfrue")
+    result = travel_time_estimate.run(place_names="Den lille Havfrue")
     assert "No starting location was given" in result
+
+
+def test_place_details_with_no_names_says_so_without_hitting_the_network():
+    # Real root cause of a live rate-limit crash: place_details/
+    # travel_time_estimate used to take one place per call, so the Concierge
+    # called them once PER place — a request scouting several places burned
+    # roughly that many extra round trips, each resending the growing
+    # conversation, which is what pushed a single run over Groq's per-minute
+    # token budget. Both tools now take a comma-separated batch instead.
+    result = place_details.run(place_names="   ,  , ")
+    assert result == "No place name given."
+
+
+def test_travel_time_estimate_with_no_names_says_so_without_hitting_the_network():
+    set_trip_start(55.68, 12.57, "Test Start")
+    result = travel_time_estimate.run(place_names="")
+    assert result == "No place name given."
 
 
 def test_haversine_km_known_distance():

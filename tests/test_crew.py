@@ -98,8 +98,8 @@ def test_place_recommendation_coerces_placeholder_filler_text_to_null():
     assert place.summary is None
 
 
-def _rate_limit_error():
-    return litellm.RateLimitError(message="rate limited", llm_provider="groq", model="llama-3.3-70b-versatile")
+def _rate_limit_error(message="rate limited"):
+    return litellm.RateLimitError(message=message, llm_provider="groq", model="llama-3.3-70b-versatile")
 
 
 class _FakeCrewOutput:
@@ -166,6 +166,39 @@ def test_plan_trip_raises_after_exhausting_all_retries(monkeypatch):
         pass
     # 1 initial attempt + MAX_RATE_LIMIT_RETRIES retries
     assert calls["n"] == 1 + crew_module.MAX_RATE_LIMIT_RETRIES
+
+
+def test_plan_trip_fails_fast_on_a_daily_quota_hit_instead_of_retrying(monkeypatch):
+    # Real failure found live: Groq raises the exact same litellm.RateLimitError
+    # for a TPM (per-minute) hit AND a TPD (per-day) hit — only the message
+    # text differs. A TPD hit's own message said "try again in 26m57s"; the
+    # 15s/30s backoff built for a TPM hit can't possibly clear that, so
+    # retrying just makes the user wait through two guaranteed failures
+    # before the real error surfaces anyway. Confirms build_crew is only
+    # ever called once (no wasted retries) and time.sleep is never called.
+    monkeypatch.setattr(crew_module, "_get_exact_cache", lambda *a, **k: None)
+    monkeypatch.setattr(crew_module, "_save_cache", lambda *a, **k: None)
+    slept = {"called": False}
+    monkeypatch.setattr(crew_module.time, "sleep", lambda *a, **k: slept.__setitem__("called", True))
+
+    calls = {"n": 0}
+
+    def kickoff_fn():
+        calls["n"] += 1
+        raise _rate_limit_error(
+            "Rate limit reached ... on tokens per day (TPD): Limit 100000, "
+            "Used 98990, Requested 2882. Please try again in 26m57.408s."
+        )
+
+    monkeypatch.setattr(crew_module, "build_crew", lambda: _FakeCrew(kickoff_fn))
+
+    try:
+        crew_module.plan_trip("test request", "2026-01-01")
+        assert False, "expected RateLimitError to propagate"
+    except litellm.RateLimitError:
+        pass
+    assert calls["n"] == 1
+    assert slept["called"] is False
 
 
 def test_place_recommendation_keeps_real_values_matching_placeholder_case_insensitively():

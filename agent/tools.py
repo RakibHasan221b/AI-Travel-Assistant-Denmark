@@ -220,7 +220,7 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
 
 
 @tool
-def search_places_near(anchor_place: str, category: str = "", limit: int | str = 5) -> str:
+def search_places_near(anchor_place: str, category: str = "", limit: int | str = 3) -> str:
     """Finds real places near ANOTHER named place, ranked by actual
     geographic distance — not text/semantic similarity, which only
     approximates proximity through wording and can return places that
@@ -348,108 +348,134 @@ def top_quality_places(category: str = "", neighborhood: str = "", limit: int | 
 
 
 @tool
-def place_details(place_name: str) -> str:
-    """Looks up everything known about one Copenhagen place by (partial)
-    name: category, neighborhood, opening hours, quality score, vibe
-    cluster, rated aspects, and its RAG-grounded AI summary with cited
-    sources. Use this before finalizing a recommendation for a specific
-    place — never state a fact about a place that isn't returned here."""
+def place_details(place_names: str) -> str:
+    """Looks up everything known about one or more Copenhagen places:
+    category, neighborhood, opening hours, quality score, vibe cluster,
+    rated aspects, and its RAG-grounded AI summary with cited sources.
+    Pass ALL the places you need in ONE call, comma-separated (e.g. "Den
+    lille Havfrue, Torvehallerne, Nyhavn") — never call this once per
+    place, since each separate call resends the whole conversation so far
+    and is a real, measured contributor to hitting Groq's per-minute token
+    limit. Never state a fact about a place that isn't returned here."""
+    names = [n.strip() for n in place_names.split(",") if n.strip()]
+    if not names:
+        return "No place name given."
+
+    blocks = []
     with connect() as conn, conn.cursor() as cur:
-        resolved = _resolve_place(cur, place_name)
-        if not resolved:
-            return f"No place found matching '{place_name}'."
-        place_id = resolved[0]
+        for place_name in names:
+            resolved = _resolve_place(cur, place_name)
+            if not resolved:
+                blocks.append(f"No place found matching '{place_name}'.")
+                continue
+            place_id = resolved[0]
 
-        cur.execute(
-            """
-            SELECT p.place_id, p.name, p.category, p.neighborhood, p.opening_hours,
-                   m.predicted_value AS quality_score, c.label AS cluster_label
-            FROM places p
-            LEFT JOIN ml_predictions m ON m.place_id = p.place_id AND m.target = 'quality_score'
-            LEFT JOIN place_clusters pc ON pc.place_id = p.place_id
-            LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
-            WHERE p.place_id = %s
-            LIMIT 1;
-            """,
-            (place_id,),
-        )
-        row = cur.fetchone()
-        columns = [d.name for d in cur.description]
-        place = dict(zip(columns, row))
+            cur.execute(
+                """
+                SELECT p.place_id, p.name, p.category, p.neighborhood, p.opening_hours,
+                       m.predicted_value AS quality_score, c.label AS cluster_label
+                FROM places p
+                LEFT JOIN ml_predictions m ON m.place_id = p.place_id AND m.target = 'quality_score'
+                LEFT JOIN place_clusters pc ON pc.place_id = p.place_id
+                LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
+                WHERE p.place_id = %s
+                LIMIT 1;
+                """,
+                (place_id,),
+            )
+            row = cur.fetchone()
+            columns = [d.name for d in cur.description]
+            place = dict(zip(columns, row))
 
-        cur.execute(
-            "SELECT aspect_category, avg_score, num_mentions FROM aggregated_sentiment "
-            "WHERE place_id = %s ORDER BY aspect_category;",
-            (place["place_id"],),
-        )
-        aspects = cur.fetchall()
+            cur.execute(
+                "SELECT aspect_category, avg_score, num_mentions FROM aggregated_sentiment "
+                "WHERE place_id = %s ORDER BY aspect_category;",
+                (place["place_id"],),
+            )
+            aspects = cur.fetchall()
 
-        cur.execute(
-            "SELECT summary_text, sources FROM ai_summaries WHERE place_id = %s "
-            "ORDER BY generated_at DESC LIMIT 1;",
-            (place["place_id"],),
-        )
-        summary_row = cur.fetchone()
+            cur.execute(
+                "SELECT summary_text, sources FROM ai_summaries WHERE place_id = %s "
+                "ORDER BY generated_at DESC LIMIT 1;",
+                (place["place_id"],),
+            )
+            summary_row = cur.fetchone()
 
-    quality_line = (
-        f"Quality score: {place['quality_score']:.1f}/100"
-        if place["quality_score"] is not None
-        else "Quality score: not available"
-    )
-    lines = [
-        f"{place['name']} ({place['category']}, {place['neighborhood'] or 'unknown area'})",
-        f"Opening hours: {place['opening_hours'] or 'unknown'}",
-        quality_line,
-        f"Vibe cluster: {place['cluster_label'] or 'unclustered'}",
-    ]
-    if aspects:
-        lines.append(
-            "Rated aspects: "
-            + ", ".join(f"{a[0]} {a[1]:.1f}/5 ({a[2]} mention(s))" for a in aspects)
-        )
-    if summary_row:
-        summary_text, sources = summary_row
-        lines.append(f"AI summary: {summary_text}")
-        source_urls = [s.get("source_url") for s in sources if s.get("source_url")]
-        if source_urls:
-            lines.append("Sources: " + ", ".join(source_urls))
-    else:
-        lines.append("AI summary: not available (no linked review text for this place).")
-    return "\n".join(lines)
+            quality_line = (
+                f"Quality score: {place['quality_score']:.1f}/100"
+                if place["quality_score"] is not None
+                else "Quality score: not available"
+            )
+            lines = [
+                f"{place['name']} ({place['category']}, {place['neighborhood'] or 'unknown area'})",
+                f"Opening hours: {place['opening_hours'] or 'unknown'}",
+                quality_line,
+                f"Vibe cluster: {place['cluster_label'] or 'unclustered'}",
+            ]
+            if aspects:
+                lines.append(
+                    "Rated aspects: "
+                    + ", ".join(f"{a[0]} {a[1]:.1f}/5 ({a[2]} mention(s))" for a in aspects)
+                )
+            if summary_row:
+                summary_text, sources = summary_row
+                lines.append(f"AI summary: {summary_text}")
+                source_urls = [s.get("source_url") for s in sources if s.get("source_url")]
+                if source_urls:
+                    lines.append("Sources: " + ", ".join(source_urls))
+            else:
+                lines.append("AI summary: not available (no linked review text for this place).")
+            blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
 
 
 @tool
-def travel_time_estimate(place_name: str) -> str:
+def travel_time_estimate(place_names: str) -> str:
     """Estimates straight-line distance and walk/bike time from the
-    traveler's starting point to a named place. Only useful if a starting
-    point was actually given — if it wasn't, says so plainly instead of
-    guessing a location. Not a routed transit time (no bus/metro line
-    lookup) — say "roughly" when quoting it. If walking would take more
-    than 15 minutes, suggests biking or public transit instead of walking."""
+    traveler's starting point to one or more named places. Pass ALL the
+    places you need in ONE call, comma-separated — never call this once
+    per place, since each separate call resends the whole conversation so
+    far and is a real, measured contributor to hitting Groq's per-minute
+    token limit. Only useful if a starting point was actually given — if
+    it wasn't, says so plainly instead of guessing a location. Not a
+    routed transit time (no bus/metro line lookup) — say "roughly" when
+    quoting it. If walking would take more than 15 minutes, suggests
+    biking or public transit instead of walking."""
     if _trip_start["lat"] is None:
         return "No starting location was given for this trip, so travel time can't be estimated."
 
+    names = [n.strip() for n in place_names.split(",") if n.strip()]
+    if not names:
+        return "No place name given."
+
+    blocks = []
     with connect() as conn, conn.cursor() as cur:
-        resolved = _resolve_place(cur, place_name)
-    if not resolved:
-        return f"No place found matching '{place_name}' to estimate travel time for."
-    _, _, lat, lon = resolved
+        for place_name in names:
+            resolved = _resolve_place(cur, place_name)
+            if not resolved:
+                blocks.append(f"No place found matching '{place_name}' to estimate travel time for.")
+                continue
+            _, name, lat, lon = resolved
 
-    dist_km = haversine_km(_trip_start["lat"], _trip_start["lon"], lat, lon)
-    fields = travel_fields(dist_km)
+            dist_km = haversine_km(_trip_start["lat"], _trip_start["lon"], lat, lon)
+            fields = travel_fields(dist_km)
 
-    if fields["travel_note"]:
-        return (
-            f"From {_trip_start['label']}: roughly {fields['distance_km']:.1f} km straight-line — "
-            f"that's {fields['travel_note']} (~{fields['walk_minutes']} min walk, "
-            f"~{fields['bike_minutes']} min bike). Otherwise, Copenhagen's Metro/S-train network "
-            f"covers most of the city well — worth checking a real route, since exact bus/train "
-            f"lines aren't available here."
-        )
-    return (
-        f"From {_trip_start['label']}: roughly {fields['distance_km']:.1f} km straight-line, "
-        f"about {fields['walk_minutes']} min walking or {fields['bike_minutes']} min biking."
-    )
+            if fields["travel_note"]:
+                blocks.append(
+                    f"{name} — from {_trip_start['label']}: roughly {fields['distance_km']:.1f} km "
+                    f"straight-line — that's {fields['travel_note']} (~{fields['walk_minutes']} min "
+                    f"walk, ~{fields['bike_minutes']} min bike). Otherwise, Copenhagen's Metro/S-train "
+                    f"network covers most of the city well — worth checking a real route, since exact "
+                    f"bus/train lines aren't available here."
+                )
+            else:
+                blocks.append(
+                    f"{name} — from {_trip_start['label']}: roughly {fields['distance_km']:.1f} km "
+                    f"straight-line, about {fields['walk_minutes']} min walking or "
+                    f"{fields['bike_minutes']} min biking."
+                )
+    return "\n\n".join(blocks)
 
 
 @tool

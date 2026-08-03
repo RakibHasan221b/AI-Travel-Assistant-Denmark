@@ -250,6 +250,10 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
     scout_task = Task(
         description=(
             "Traveler request: {request}\n\n"
+            "IMPORTANT: call each tool AT MOST ONCE per part of the request — never call the same "
+            "tool with the same arguments a second time. The moment your tool results cover every "
+            "part of the request, stop calling tools and give your final answer immediately; do not "
+            "re-call a tool you already have a result from just to double-check it.\n\n"
             "First, work out what parts of the request you need to cover — a request can have more "
             "than one part (e.g. 'see the Little Mermaid AND have coffee nearby' has two parts: a "
             "named place, and an open-ended category). Cover every part, but only that many:\n"
@@ -257,9 +261,11 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "confirm it exists. Do not add unrelated extra candidates for this part.\n"
             "- An open-ended part that says it's near/close to/around ANOTHER specific named place "
             "(e.g. 'coffee nearby' when a landmark was also named, 'a hotel near Torvehallerne') → "
-            "use search_places_near with that other place as the anchor. This ranks by real "
-            "geographic distance, not wording — do not use search_places for this, since text "
-            "similarity alone doesn't mean something is actually close by.\n"
+            "use search_places_near with that other place as the anchor and a small limit (2-3, "
+            "its default) unless the traveler clearly asked for more options — a few genuinely close "
+            "picks beat a long list. This ranks by real geographic distance, not wording — do not "
+            "use search_places for this, since text similarity alone doesn't mean something is "
+            "actually close by.\n"
             "- An open-ended part with no reference point (a vibe, category, or 'best of' request "
             "with nothing to be near, e.g. 'a cozy cafe somewhere in the city') → find 1-3 real "
             "candidates with search_places (vibe/description match) or top_quality_places "
@@ -287,7 +293,8 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
         description=(
             "Target date: {target_date}\n\n"
             "Check weather and outdoor-interest conditions for that date using "
-            "weather_conditions. If the date is out of the stored range, report that "
+            "weather_conditions — call it once, then report your finding immediately, don't "
+            "re-call it to double-check. If the date is out of the stored range, report that "
             "plainly instead of guessing."
         ),
         expected_output="A short note on weather and whether conditions favor outdoor/indoor places.",
@@ -296,16 +303,21 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
 
     concierge_task = Task(
         description=(
-            "Using the Place Scout's candidates and the Conditions Analyst's timing note, "
-            "call place_details on EVERY place the Scout returned for: {request} (target date: "
-            "{target_date}) — not just the best one. If the Scout covered multiple parts of the "
-            "request, include a result for each; don't collapse to one place. Fill name/category/"
-            "neighborhood/opening_hours/quality_score/vibe_cluster/summary/sources from "
+            "IMPORTANT: never call the same tool with the same arguments twice — one batched "
+            "place_details call and one batched travel_time_estimate call (if a start location was "
+            "given) is enough; the moment you have those results, stop calling tools and write your "
+            "final answer.\n\n"
+            "Using the Place Scout's candidates and the Conditions Analyst's timing note, call "
+            "place_details ONCE with every place the Scout returned, comma-separated, for: "
+            "{request} (target date: {target_date}) — never call place_details separately per "
+            "place, that wastes tokens and risks a rate limit. If the Scout covered multiple parts "
+            "of the request, include a result for each; don't collapse to one place. Fill name/"
+            "category/neighborhood/opening_hours/quality_score/vibe_cluster/summary/sources from "
             "place_details' actual output — null if unavailable, never guessed. Don't recommend "
-            "a place you didn't call place_details on.\n\n"
-            "EXCEPTION: for a place the Scout found only via search_place_live, skip place_details "
-            "(it isn't in the database) — use the live-lookup result as-is, leave quality_score/"
-            "vibe_cluster/summary/sources null.\n\n"
+            "a place you didn't get from place_details.\n\n"
+            "EXCEPTION: for a place the Scout found only via search_place_live, leave it out of "
+            "that place_details call (it isn't in the database) — use the live-lookup result as-is, "
+            "leave quality_score/vibe_cluster/summary/sources null.\n\n"
             "why_recommended and overall_note must sound like a real concierge talking to a "
             "traveler, not a system describing itself: never mention how a place was found (a "
             "tool, 'live lookup', 'our database'), and never comment on what data is/isn't "
@@ -318,8 +330,9 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "required, 2-4 sentences tying the recommendation together like a real concierge "
             "speaking — never empty.\n\n"
             "Traveler's starting point: {start_location}. If given (not 'not provided'), call "
-            "travel_time_estimate per place and fill distance_km/walk_minutes/bike_minutes/"
-            "travel_note. If not given, leave those four null — never guess a location."
+            "travel_time_estimate ONCE with every place name comma-separated (same rule as "
+            "place_details — one call, not one per place) and fill distance_km/walk_minutes/"
+            "bike_minutes/travel_note. If not given, leave those four null — never guess a location."
         ),
         expected_output=(
             "A TripPlanOutput: every place the Scout found (not just one, unless the Scout only "
@@ -507,7 +520,19 @@ def plan_trip(request: str, target_date: str, start_location: str = "", _retry_w
     }
     try:
         result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
-    except litellm.RateLimitError:
+    except litellm.RateLimitError as e:
+        # Found live: Groq enforces two separate ceilings — TPM (tokens per
+        # minute) AND TPD (tokens per day) — and raises the exact same
+        # litellm.RateLimitError for both, distinguishable only by the
+        # message text. The backoff below (15s, 30s) is sized for a TPM hit,
+        # which genuinely clears within a minute; a TPD hit's real message
+        # says "try again in 26m57s" — no amount of short retrying can ever
+        # succeed, so retrying anyway just makes the user wait through two
+        # guaranteed failures before the real error surfaces. Fail fast
+        # instead when it's a daily hit.
+        if "tokens per day" in str(e).lower():
+            log.warning(f"Groq daily token quota exhausted, not retrying (needs minutes, not seconds): {e}")
+            raise
         result = None
         last_error = None
         for attempt in range(MAX_RATE_LIMIT_RETRIES):
