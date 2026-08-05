@@ -1,0 +1,24 @@
+{
+  "feature_order": [
+    "distilbert_sentiment",
+    "minilm_good_probability",
+    "has_subcategory",
+    "has_opening_hours",
+    "has_phone",
+    "has_website",
+    "has_price_level",
+    "price_level",
+    "review_count",
+    "cat_cafe",
+    "cat_hotel",
+    "cat_landmark",
+    "cat_restaurant"
+  ],
+  "category_columns": [
+    "cat_cafe",
+    "cat_hotel",
+    "cat_landmark",
+    "cat_restaurant"
+  ],
+  "good_threshold": 4.0
+}
