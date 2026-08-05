@@ -36,6 +36,7 @@ keeps it at one instance/one connection pattern instead of a second,
 memory-doubling copy in a second "private" module.
 """
 
+import logging
 import math
 import os
 import time
@@ -49,6 +50,8 @@ from fastembed import TextEmbedding
 from pgvector.psycopg import register_vector
 
 load_dotenv()
+
+log = logging.getLogger("tools")
 
 # Set once per plan_trip() call, before crew.kickoff() — a module-level
 # global, not a per-request object, because crewai's @tool functions are
@@ -372,10 +375,14 @@ def place_details(place_names: str) -> str:
 
             cur.execute(
                 """
-                SELECT p.place_id, p.name, p.category, p.neighborhood, p.opening_hours,
-                       m.predicted_value AS quality_score, c.label AS cluster_label
+                SELECT p.place_id, p.name, p.category, p.subcategory, p.neighborhood,
+                       p.opening_hours, p.price_level, p.osm_tags,
+                       m.predicted_value AS old_quality_score,
+                       d.predicted_value AS distilbert_sentiment_score,
+                       c.label AS cluster_label
                 FROM places p
                 LEFT JOIN ml_predictions m ON m.place_id = p.place_id AND m.target = 'quality_score'
+                LEFT JOIN ml_predictions d ON d.place_id = p.place_id AND d.target = 'distilbert_sentiment'
                 LEFT JOIN place_clusters pc ON pc.place_id = p.place_id
                 LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
                 WHERE p.place_id = %s
@@ -401,15 +408,48 @@ def place_details(place_names: str) -> str:
             )
             summary_row = cur.fetchone()
 
-            quality_line = (
-                f"Quality score: {place['quality_score']:.1f}/100"
-                if place["quality_score"] is not None
-                else "Quality score: not available"
+            cur.execute(
+                "SELECT text_content FROM reviews_raw WHERE place_id = %s ORDER BY review_id;",
+                (place["place_id"],),
+            )
+            review_texts = [r[0] for r in cur.fetchall()]
+
+            # Live recommendation score, replacing the old pre-computed
+            # quality_score — computed fresh from this place's CURRENT raw
+            # review text, never a stored number. The old score is kept
+            # only in a server-side log for comparison, never shown to the
+            # traveler, matching the real evidence that it correlates far
+            # more weakly with actual outcomes (r=0.171 vs 0.668).
+            from agent.recommendation_service import predict_recommendation
+
+            tags = place["osm_tags"] or {}
+            recommendation = predict_recommendation({
+                "name": place["name"],
+                "category": place["category"],
+                "subcategory": place["subcategory"],
+                "opening_hours": place["opening_hours"],
+                "price_level": place["price_level"],
+                "has_phone": bool(tags.get("phone")),
+                "has_website": bool(tags.get("website")),
+                "review_count": len(review_texts),
+                "reviews": review_texts,
+                "distilbert_sentiment_score": place["distilbert_sentiment_score"],
+            })
+            log.info(
+                f"{place['name']!r}: old_quality_score={place['old_quality_score']} "
+                f"new_recommendation={recommendation}"
+            )
+
+            confidence_line = (
+                f"Recommendation confidence: {recommendation['recommendation_probability']*100:.0f}% "
+                f"({recommendation['label']})"
+                if recommendation["signals"]["has_review_text"]
+                else "Recommendation confidence: not available (no review text for this place)"
             )
             lines = [
                 f"{place['name']} ({place['category']}, {place['neighborhood'] or 'unknown area'})",
                 f"Opening hours: {place['opening_hours'] or 'unknown'}",
-                quality_line,
+                confidence_line,
                 f"Vibe cluster: {place['cluster_label'] or 'unclustered'}",
             ]
             if aspects:

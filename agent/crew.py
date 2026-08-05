@@ -26,7 +26,7 @@ import psycopg
 import requests
 from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 from agent.tools import (
     haversine_km,
@@ -121,7 +121,23 @@ class PlaceRecommendation(BaseModel):
     category: str
     neighborhood: str = "unknown area"
     opening_hours: str | None = Field(None, description="From place_details, null if unknown")
-    quality_score: float | None = Field(None, description="0-100, null if not available")
+    # Renamed from quality_score after real evaluation showed why the name
+    # was wrong, not just outdated: the old model (structured metadata only,
+    # no review text) correlated weakly with real outcomes (r=0.171). The
+    # model that replaced it (DistilBERT + MiniLM sentiment signals plus
+    # structured features, computed live from a place's current review
+    # text, never a stored number) correlated far more strongly (r=0.668) —
+    # but it estimates "how likely is this place to be a good
+    # recommendation," not an objective quality rating, so the field name
+    # needed to say that honestly instead of implying a precision the model
+    # doesn't have. quality_score is kept, deprecated, mirroring the same
+    # value, only so the not-yet-updated frontend doesn't break.
+    recommendation_confidence: float | None = Field(
+        None, description="0-100, from place_details' live recommendation model — null if no review text was available"
+    )
+    recommendation_label: str | None = Field(
+        None, description="'recommended' or 'not recommended', from place_details — null if recommendation_confidence is null"
+    )
     vibe_cluster: str | None = None
     summary: str | None = Field(None, description="The AI-grounded summary, null if not available")
     sources: list[str] = Field(default_factory=list)
@@ -176,6 +192,14 @@ class PlaceRecommendation(BaseModel):
         if isinstance(v, str) and v.strip().lower() in _PLACEHOLDER_VALUES:
             return None
         return v
+
+    @computed_field
+    @property
+    def quality_score(self) -> float | None:
+        """Deprecated — mirrors recommendation_confidence exactly. Exists
+        only so the not-yet-updated frontend doesn't break; remove once
+        the frontend reads recommendation_confidence directly instead."""
+        return self.recommendation_confidence
 
 
 class TripPlanOutput(BaseModel):
@@ -233,7 +257,7 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
         goal="Turn the scouted places and real conditions into one honest, specific recommendation.",
         backstory=(
             "You write the final answer a traveler actually reads. You pull rich detail "
-            "(quality score, vibe cluster, rated aspects, AI summary with sources) for "
+            "(recommendation confidence, vibe cluster, rated aspects, AI summary with sources) for "
             "each place you recommend, check real weather and the Outdoor Interest Index "
             "before anyone commits to an itinerary, and you never oversell a place with "
             "thin evidence. " + GROUNDING_RULE
@@ -300,12 +324,16 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "{request} (target date: {target_date}) — never call place_details separately per "
             "place, that wastes tokens and risks a rate limit. If the Scout covered multiple parts "
             "of the request, include a result for each; don't collapse to one place. Fill name/"
-            "category/neighborhood/opening_hours/quality_score/vibe_cluster/summary/sources from "
-            "place_details' actual output — null if unavailable, never guessed. Don't recommend "
-            "a place you didn't get from place_details.\n\n"
+            "category/neighborhood/opening_hours/recommendation_confidence/recommendation_label/"
+            "vibe_cluster/summary/sources from place_details' actual output — null if unavailable, "
+            "never guessed. recommendation_confidence and recommendation_label are exactly what "
+            "place_details' \"Recommendation confidence\" line says, a live estimate of how likely "
+            "this place is to be a good recommendation, not an objective quality rating — report "
+            "them as returned, don't reinterpret or round them. Don't recommend a place you didn't "
+            "get from place_details.\n\n"
             "EXCEPTION: for a place the Scout found only via search_place_live, leave it out of "
             "that place_details call (it isn't in the database) — use the live-lookup result as-is, "
-            "leave quality_score/vibe_cluster/summary/sources null.\n\n"
+            "leave recommendation_confidence/recommendation_label/vibe_cluster/summary/sources null.\n\n"
             "why_recommended and overall_note must sound like a real concierge talking to a "
             "traveler, not a system describing itself: never mention how a place was found (a "
             "tool, 'live lookup', 'our database'), and never comment on what data is/isn't "
@@ -324,7 +352,7 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
         ),
         expected_output=(
             "A TripPlanOutput: every place the Scout found (not just one, unless the Scout only "
-            "found one), each with its real quality score, hours, sources, and why it fits; "
+            "found one), each with its real recommendation confidence, hours, sources, and why it fits; "
             "near_place/near_distance_km filled in for places found via search_places_near; a "
             "weather summary for the target date; travel time fields filled in only if a "
             "starting point was given; and a real 2-4 sentence overall_note tying the "
