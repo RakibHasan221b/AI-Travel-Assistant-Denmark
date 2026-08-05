@@ -52,6 +52,11 @@ class PlaceRecommendation(BaseModel):
     category: str
     neighborhood: str = "unknown area"
     opening_hours: str | None = None
+    recommendation_confidence: float | None = None
+    recommendation_label: str | None = None
+    # Deprecated — mirrors recommendation_confidence exactly, kept only so
+    # the not-yet-updated frontend doesn't break. Remove once the frontend
+    # reads recommendation_confidence directly instead (see agent/crew.py).
     quality_score: float | None = None
     vibe_cluster: str | None = None
     summary: str | None = None
