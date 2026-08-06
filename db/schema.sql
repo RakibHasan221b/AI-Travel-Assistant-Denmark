@@ -31,7 +31,7 @@ CREATE INDEX idx_places_embedding ON places USING hnsw (embedding vector_cosine_
 CREATE TABLE reviews_raw (
     review_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     place_id        uuid REFERENCES places (place_id),
-    source_type     text NOT NULL CHECK (source_type IN ('seed', 'wikivoyage', 'reddit_post', 'reddit_comment', 'web_search')),
+    source_type     text NOT NULL CHECK (source_type IN ('seed', 'wikivoyage', 'wikipedia', 'reddit_post', 'reddit_comment', 'web_search')),
     source_id       text,
     source_url      text,
     author_hash     text,                   -- hashed, never raw username
