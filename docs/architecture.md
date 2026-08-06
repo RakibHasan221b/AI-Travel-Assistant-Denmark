@@ -174,10 +174,114 @@ still reproduces `r=0.171` exactly), confirming the relocation didn't
 quietly change what the model actually predicts.
 
 **Real, current memory measurement of the actual deployed entrypoint**
-(`api.main`, staged with `psutil`, one real inference call, values
-measured on Windows — Render's actual containers run Linux, so treat
-this as a strong signal, not a Linux-exact number): peaks around
-**~410MB**, stable across repeated calls (no growth after 10 calls).
-Under Render's 512MB limit with real margin, though about 10MB over the
-stricter <400MB safety target set for this phase — worth a real check
-against Render's own memory graph after deploying, not assumed closed.
+(`api.main`, staged with `psutil`, cold start + 30 sequential + 40
+concurrent requests, values measured on Windows — Render's actual
+containers run Linux): peaks around **~410MB cold, ~436-441MB under
+concurrent load**, stable and reproducible across repeated runs, with
+explicit singleton checks confirming no duplicate model instances.
+
+**Production memory metrics could not be directly verified** — Render's
+free tier does not expose application memory/CPU metrics at all (a paid
+instance type is required to see that data), confirmed by checking the
+live dashboard directly, not assumed. Stability is instead inferred from:
+both `36eb938` and `7f3bf3d` deployed and started cleanly (clean
+`Application startup complete` in ~1s in the real startup logs, no
+import/artifact errors), no restarts or OOM kills observed, and the
+repeated, reproducible local measurements above were taken against the
+real production entrypoint, not an artificial import script. This is a
+real, acknowledged gap, not a closed question — if it ever needs a hard
+number, the honest path is a paid instance tier (to see Render's own
+graph) or the app self-reporting via a real endpoint, not a guess.
+
+## Live weather: from a periodic batch table to an on-demand Open-Meteo call
+
+`agent/tools.py`'s `weather_conditions()` used to only read `weather_daily`,
+a table populated purely by `ingestion/weather.py`'s periodic batch run
+(historical backfill + a 7-day forecast snapshot). Real, current evidence
+this had already gone stale in production: a live log capture showed
+`"No weather data stored for 2026-08-10. Available range is 2025-01-01 to
+2026-08-01"` — the batch job hadn't run in days, so even *today's* date had
+no weather. The batch table is a real, useful cache; it just isn't a
+substitute for asking Open-Meteo directly when the cache has gone cold.
+
+**Fix: cache-aside, not a redesign.** On a `weather_daily` miss,
+`_fetch_and_cache_live_weather()` calls Open-Meteo directly for that one
+date — the archive endpoint for any past date (weather doesn't change, safe
+to fetch on demand), the forecast endpoint for today through 16 days out
+(Open-Meteo's own real free-tier limit, driven by what the API actually
+returns for that date rather than a guessed cutoff) — then upserts the
+result into `weather_daily` so the next request for the same date hits the
+cache. `ingestion/weather.py`'s periodic batch run still exists and still
+matters (keeps the common near-term window warm without a live call on
+every single request), this just closes the gap when it's stale or a date
+falls outside what it last covered.
+
+**Kept honest, not guessed, past the real forecast horizon:** a date more
+than 16 days out returns a plain "beyond Open-Meteo's real forecast
+horizon, ask again closer to the date" message rather than inventing a
+number. Real weather (temp/precip/wind) and the separate Outdoor Interest
+Index (`visit_time_forecast`, Phase 10's trained model) are kept honestly
+distinct — the Index is still only precomputed for whatever window
+`forecast_interest.py`'s own batch run last covered, unrelated to weather's
+new live-fetch range, and the tool's own text says so rather than implying
+one covers the other.
+
+Verified for real (pure Python, no LLM cost): today, +5 days, and a recent
+past date all now return live-fetched, correctly-cached weather that was
+previously missing; +25 days correctly returns the honest out-of-range
+message. 50/50 tests passing (49 prior + one new offline test covering the
+forecast-horizon cutoff, matching this suite's existing no-real-network/DB
+convention).
+
+## Production verification found a real, separate retrieval limitation — not a Phase A defect
+
+Running one real end-to-end `/trip-plan` request against production
+(after deploying `36eb938`/`7f3bf3d`) confirmed the recommendation
+pipeline itself is deployed and working: `recommendation_confidence`/
+`recommendation_label` are genuinely present in the real API response
+(proving the `api/main.py` schema fix is live — previously these fields
+would have been silently dropped, since Pydantic ignores undeclared
+fields on construction). But for this specific request they came back
+`null`, because the Place Scout never called `search_places`/
+`top_quality_places` at all (confirmed directly in Render's logs — zero
+real tool invocations, only the fallback `search_place_live` fired) and
+fell back to the live Nominatim lookup, whose results are explicitly
+never scored (`agent/crew.py`'s Concierge instructions require this).
+
+**Root-caused with a direct, deterministic check (`search_places("Den
+lille Havfrue")`), not another live agent run:** the real statue ranks
+**#39** for a query of its own exact name — real, distinct Copenhagen
+landmarks with similar names outrank it (`Den Genmodificerede Lille
+Havfrue` at #1, `Den lille havfrue #2` at #11 — both confirmed via real
+coordinates to be genuinely different places, not duplicate data, not a
+data-quality bug). This is a **known, common limitation of embedding-only
+retrieval**: semantic similarity optimizes for "what is this text about,"
+not exact entity identity, so several real landmarks sharing similar
+name/description text can outrank the one an exact-name query actually
+means.
+
+**This is a pre-existing Phase 6 (semantic search) limitation, unrelated
+to and not introduced by the Phase A DistilBERT relocation** — Phase A's
+own correctness is fully confirmed independent of this (the schema fix is
+live, the null-handling path for live-lookup-only places works exactly as
+designed). Tracked separately as Phase B below rather than folded into
+Phase A's scope.
+
+## Phase B (planned, not started): hybrid retrieval ranking
+
+Add a lightweight lexical/fuzzy-match signal alongside the existing
+pgvector semantic search, rather than trying to "fix" the embedding
+itself — the standard pattern for named-entity queries in production
+search systems (lexical + fuzzy + semantic + rerank, not a single
+embedding score):
+
+1. Normalize names (case-fold, strip accents/punctuation) for exact/
+   fuzzy matching.
+2. Boost heavily on an exact or near-exact normalized name match, e.g.
+   `final_score = 0.7 * embedding_similarity + 0.3 * exact/fuzzy_name_score`.
+3. Keep semantic similarity as the base signal for non-exact, descriptive
+   queries — this isn't a replacement, only help for the exact-name case.
+4. Re-evaluate against real canonical queries once built: "Den lille
+   Havfrue", "Tivoli", "Nyhavn", "Rosenborg Castle" — confirm the intended
+   place actually lands in the top few results, not just the exact-name
+   case that surfaced this.
