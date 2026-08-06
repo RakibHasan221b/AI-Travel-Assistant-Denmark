@@ -310,6 +310,50 @@ its own official site on the first, best-ranked tier.
 the domain-tier ranking, matching this suite's existing no-real-network/DB
 convention).
 
+## Frontend: retiring `quality_score` from the Trip Planner
+
+`web/lib/types.ts`'s `PlaceRecommendation` interface and
+`web/components/trip-planner/PlaceCard.tsx` were the only two places in
+the frontend actually reading `quality_score` for the Trip Planner path —
+confirmed by grepping the whole `web/` tree, not assumed. Both now use
+`recommendation_confidence`/`recommendation_label` directly; the card
+shows "87% / RECOMMENDED" instead of "87/100 Quality", matching what the
+model actually claims (a live recommendation estimate, not an objective
+quality rating). `ExplorePlaceResult` and the Stats types keep their own,
+separate `quality_score` fields untouched — the Explore page and Stats
+Dashboard still correctly read `ml_predictions.quality_score` directly, by
+design, unrelated to this rename.
+
+With the frontend no longer reading it, the deprecated `quality_score`
+mirror was removed from both `agent/crew.py`'s `PlaceRecommendation`
+(the `@computed_field` and its now-dead `computed_field` import) and
+`api/main.py`'s independently-declared response model — confirmed via a
+direct `model_dump()` check that `quality_score` no longer appears in the
+serialized output at all.
+
+**Verified for real in a live browser, not just by reading the diff:**
+ran both a local FastAPI server and the Next.js dev server together,
+submitted the exact same request as an existing real cache entry ("tell
+me about den lille havfrue") to confirm the null-confidence path renders
+cleanly (no badge, no crash, no "undefined%"), then one new real request
+("tell me about AOC restaurant") to confirm the populated path — the card
+correctly showed "96% / RECOMMENDED", and the same response also carried
+today's live-fetched weather ("high 22.9°C... 0.0mm precipitation"),
+confirming both of today's backend changes work together end-to-end
+through the actual UI. Zero console errors; `tsc --noEmit` clean.
+
+**A real, separate mistake made and recovered during this phase, worth
+recording honestly:** while wiring up local preview servers, a Bash check
+for `.claude/launch.json` reported "no such file," which was wrongly
+taken as proof the file didn't exist — it did, with two real working dev-
+server configs (`web-trip-planner`, `static-guides`), and got overwritten.
+`.claude/` is gitignored, so git history couldn't help. `web-trip-planner`
+was fully recovered from an untouched second copy at `web/.claude/launch.json`;
+`static-guides` was searched for across the entire project and filesystem
+and never found — left out rather than guessed at. Lesson: a single
+tool's "not found" is not proof of absence for a file inferred to matter,
+especially gitignored local config with no git-history safety net.
+
 ## Production verification found a real, separate retrieval limitation — not a Phase A defect
 
 Running one real end-to-end `/trip-plan` request against production

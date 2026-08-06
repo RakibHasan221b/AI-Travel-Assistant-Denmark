@@ -11,7 +11,8 @@ export interface PlaceRecommendation {
   category: string;
   neighborhood: string;
   opening_hours: string | null;
-  quality_score: number | null;
+  recommendation_confidence: number | null;
+  recommendation_label: string | null;
   vibe_cluster: string | null;
   summary: string | null;
   sources: string[];
