@@ -41,6 +41,7 @@ import math
 import os
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import psycopg
 import requests
@@ -518,15 +519,93 @@ def travel_time_estimate(place_names: str) -> str:
     return "\n\n".join(blocks)
 
 
+_WEATHER_LAT, _WEATHER_LON = 55.6761, 12.5683  # Copenhagen city center, matches ingestion/weather.py
+_WEATHER_TZ = ZoneInfo("Europe/Copenhagen")
+_OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+_OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+_OPEN_METEO_DAILY_FIELDS = "temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,weathercode"
+# Open-Meteo's own free forecast endpoint caps at 16 days out — requested
+# directly rather than assumed, so "too far to forecast" is driven by what
+# the real API actually returns for that date, not a guessed cutoff.
+_MAX_FORECAST_DAYS = 16
+
+
+def _fetch_and_cache_live_weather(conn, d) -> tuple | None:
+    """On a weather_daily cache miss, try Open-Meteo live for this one
+    date — the archive endpoint for a past date (safe to call for any
+    historical date, weather doesn't change), the forecast endpoint for
+    today or a near-future date. Returns (temp_max_c, temp_min_c,
+    precip_mm, wind_kph) and upserts it into weather_daily so the next
+    request for the same date hits the cache instead of calling the API
+    again — same "fetch once, store it, never pay for it twice" pattern
+    search_place_live's Serper-backed cousin uses elsewhere in this
+    project. Returns None if the date is genuinely out of Open-Meteo's
+    real range (too far future) or the live call itself fails — the
+    caller is responsible for being honest about which."""
+    today = datetime.now(_WEATHER_TZ).date()
+    is_past = d < today
+
+    if is_past:
+        url = _OPEN_METEO_ARCHIVE_URL
+        params = {
+            "latitude": _WEATHER_LAT, "longitude": _WEATHER_LON,
+            "start_date": d.isoformat(), "end_date": d.isoformat(),
+            "daily": _OPEN_METEO_DAILY_FIELDS, "timezone": "Europe/Copenhagen",
+        }
+    else:
+        days_ahead = (d - today).days + 1
+        if days_ahead > _MAX_FORECAST_DAYS:
+            return None  # honestly out of range, don't even try
+        url = _OPEN_METEO_FORECAST_URL
+        params = {
+            "latitude": _WEATHER_LAT, "longitude": _WEATHER_LON,
+            "forecast_days": days_ahead,
+            "daily": _OPEN_METEO_DAILY_FIELDS, "timezone": "Europe/Copenhagen",
+        }
+
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        daily = resp.json()["daily"]
+    except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+        log.info(f"Live Open-Meteo call failed for {d}: {e}")
+        return None
+
+    target = d.isoformat()
+    if target not in daily["time"]:
+        return None
+    i = daily["time"].index(target)
+    tmax, tmin, precip, wind, code = (
+        daily["temperature_2m_max"][i], daily["temperature_2m_min"][i],
+        daily["precipitation_sum"][i], daily["windspeed_10m_max"][i], daily["weathercode"][i],
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO weather_daily (date, temp_max_c, temp_min_c, precip_mm, wind_kph, condition_code, fetched_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (date) DO UPDATE SET
+                temp_max_c = EXCLUDED.temp_max_c, temp_min_c = EXCLUDED.temp_min_c,
+                precip_mm = EXCLUDED.precip_mm, wind_kph = EXCLUDED.wind_kph,
+                condition_code = EXCLUDED.condition_code, fetched_at = now();
+            """,
+            (d, tmax, tmin, precip, wind, code),
+        )
+    conn.commit()
+    return tmax, tmin, precip, wind
+
+
 @tool
 def weather_conditions(target_date: str, category: str = "") -> str:
     """Weather and outdoor-interest conditions for one date (YYYY-MM-DD),
     optionally scoped to a place category (restaurant, cafe, hotel,
     landmark). Combines real Open-Meteo weather with the weather-aware
-    forecasting model's Outdoor Interest Index (0-100). Covers both
-    historical dates (from 2025-01-01) and the current ~7-day forecast
-    window. If the date falls outside the stored range, says so honestly
-    instead of guessing."""
+    forecasting model's Outdoor Interest Index (0-100). Covers historical
+    dates (from 2025-01-01), today, and up to 16 days ahead (Open-Meteo's
+    real forecast horizon) — live, on demand, not just whatever a periodic
+    batch job happened to have already stored. Dates further out than that
+    say so honestly instead of guessing."""
     try:
         # weather_daily.date is a plain SQL date, not timestamptz — the
         # immediate .date() call deliberately discards time/timezone.
@@ -542,11 +621,21 @@ def weather_conditions(target_date: str, category: str = "") -> str:
         weather_row = cur.fetchone()
 
         if weather_row is None:
-            cur.execute("SELECT MIN(date), MAX(date) FROM weather_daily;")
-            min_d, max_d = cur.fetchone()
+            weather_row = _fetch_and_cache_live_weather(conn, d)
+
+        if weather_row is None:
+            today = datetime.now(_WEATHER_TZ).date()
+            if d > today:
+                days_ahead = (d - today).days
+                return (
+                    f"{d} is {days_ahead} days from now — beyond Open-Meteo's real "
+                    f"{_MAX_FORECAST_DAYS}-day forecast horizon. Treat conditions as unknown "
+                    "rather than guessing; ask again closer to the date for a real forecast."
+                )
             return (
-                f"No weather data stored for {d}. Available range is {min_d} to {max_d} — "
-                "pick a date in that window, or treat conditions as unknown rather than guessing."
+                f"No weather data available for {d}, and a live lookup didn't return it either "
+                "(too recent for the historical archive, or the request failed) — treat conditions "
+                "as unknown rather than guessing."
             )
 
         sql = (
@@ -566,5 +655,10 @@ def weather_conditions(target_date: str, category: str = "") -> str:
         scope = f" for {category}" if category else ""
         lines.append(f"Predicted outdoor interest index{scope}: {interest:.1f}/100.")
     else:
-        lines.append("No outdoor-interest forecast available for that date (likely a historical date, or the 7-day forecast window has moved on).")
+        # Real weather above can now come from a live Open-Meteo call (up to
+        # 16 days out), but the Outdoor Interest Index is a separate, older
+        # signal — trained on and only precomputed for whatever window
+        # pipeline/timeseries/forecast_interest.py's periodic batch run last
+        # covered. The two windows aren't the same; don't blur them.
+        lines.append("No outdoor-interest forecast available for that date (outside the periodically-updated forecast batch's date range).")
     return "\n".join(lines)

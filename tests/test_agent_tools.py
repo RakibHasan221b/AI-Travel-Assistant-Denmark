@@ -9,6 +9,8 @@ import requests
 
 from agent.tools import (
     _coerce_limit,
+    _fetch_and_cache_live_weather,
+    _MAX_FORECAST_DAYS,
     haversine_km,
     place_details,
     search_place_live,
@@ -46,6 +48,18 @@ def test_tools_have_names_and_descriptions():
 def test_weather_conditions_rejects_unparsable_date_without_hitting_the_network():
     result = weather_conditions.run(target_date="not-a-date")
     assert "Could not parse" in result
+
+
+def test_live_weather_refuses_dates_beyond_open_meteos_real_forecast_horizon():
+    # Real problem this guards: guessing weather for a date Open-Meteo
+    # can't actually forecast yet, instead of saying so honestly. Checked
+    # before any network/DB call — conn=None here would crash immediately
+    # if that ordering ever regressed, which is the point of the test.
+    from datetime import date, timedelta
+
+    too_far = date.today() + timedelta(days=_MAX_FORECAST_DAYS + 5)
+    result = _fetch_and_cache_live_weather(conn=None, d=too_far)
+    assert result is None
 
 
 def test_travel_time_estimate_without_a_start_point_says_so_without_hitting_the_network():
