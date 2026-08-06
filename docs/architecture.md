@@ -233,6 +233,83 @@ message. 50/50 tests passing (49 prior + one new offline test covering the
 forecast-horizon cutoff, matching this suite's existing no-real-network/DB
 convention).
 
+## Live place-knowledge fallback: not "Wikipedia fallback" — ranked sources
+
+Some curated places have zero linked `reviews_raw` text at all (never had
+seed/Wikivoyage/review data ingested), so `place_details` had nothing to
+score and honestly said so. `agent/tools.py`'s `place_details()` now
+triggers a one-time live fallback when — and only when — a resolved place's
+`review_texts` comes back empty: `_fetch_place_knowledge()` searches for
+real, storable text, stores whatever's found as an ordinary `reviews_raw`
+row (a new `reviews_raw.source_type` value, `'wikipedia'`, was added
+alongside the existing ones — a real, small `ALTER TABLE` migration, not
+just a docs change, applied to both `db/schema.sql` and the live database),
+and returns it so the *same* request can score against it immediately, not
+just the next one. Every later call sees the now-non-empty `review_texts`
+from the normal `SELECT` and skips this branch entirely — the caching is
+free, inherent in the existing query, not a separate mechanism.
+
+**Deliberately not framed as "Wikipedia fallback."** The original plan led
+with Wikipedia; real testing showed why that's the wrong default. A live
+test against "Absalon" (a real landmark — a 1901 statue of the historical
+bishop by Vilhelm Bissen) found a genuine, on-topic Wikipedia summary — but
+it's a biography, not a description of the landmark or why a traveler
+would visit, and the recommendation classifier scored it only 49%/"not
+recommended" partly as a result. The system's actual job is answering "why
+should I visit this place," which a real official site or a Copenhagen
+tourism organization answers far better than an encyclopedia entry.
+
+**The real hierarchy, in order:**
+1. **The place's own official site** (from OSM's real `website` tag on
+   that exact place — the strongest possible signal) — searched directly
+   with a `site:`-scoped query, not just hoped for in general results.
+2. **General Copenhagen search results**, ranked: known tourism-org domains
+   (`visitcopenhagen.com`, `wonderfulcopenhagen.dk` — a short, hand-verified
+   allowlist, not a heuristic guess) above generic snippets.
+3. **Wikipedia**, only if nothing above found anything usable at all.
+
+Every stored row's `raw_payload` records which real tier it came from
+(`official_site` / `tourism_org` / `search_snippet` / the Wikipedia
+extract itself) — so it's always possible to tell later exactly where a
+description came from, not just that it came from "the web."
+
+**A real bug caught and fixed by testing against a real, generically-named
+place, not assumed safe:** "Abstrakt skulptur" (Danish for "abstract
+sculpture" — not a unique proper noun) had its Serper results confidently
+link three e-commerce listings for decorative sculpture *products*,
+completely unrelated to the real public artwork — `web_enrichment.py`'s
+existing `filter_results()` only screens snippet length and known
+low-signal social domains, nothing about actual topical relevance. Fixed
+with `_mentions_copenhagen_or_denmark()`, a real (if imperfect) relevance
+gate requiring an explicit Copenhagen/Denmark/København mention in the
+text itself, applied identically to Wikipedia and general-search results.
+Re-tested after the fix: the tool now correctly finds nothing and says so
+honestly, rather than storing wrong data confidently.
+
+**A second, real limitation found and left honestly unresolved, not
+papered over:** "Absalon" turned out to be genuinely ambiguous — the
+historical bishop, a real *different* modern community venue (a
+converted church), and a hotel all share the name. The database's actual
+record is the 1901 statue (confirmed via its own OSM tags: sculptor
+Vilhelm Bissen, a real official source `samlingen.koes.dk`), but that
+niche Danish public-art-registry page turned out not to be indexed by
+Google at all (`site:samlingen.koes.dk Absalon` returns zero results,
+confirmed directly, not assumed) — so even the site-scoped search
+couldn't find it, and the general search's tourism-org match was
+confidently, plausibly, but *wrongly* about the unrelated community venue
+instead. **This is the same underlying problem as the retrieval-ranking
+limitation found during production verification** (multiple real,
+distinct Copenhagen entities sharing similar/identical names) — not
+fixed here, deliberately, to avoid scope creep into Phase B's territory;
+flagged as a real, known gap rather than hidden. Verified the common case
+works well instead: "AOC" (an unambiguous real restaurant with its own
+well-indexed domain) correctly found three genuinely on-topic pages from
+its own official site on the first, best-ranked tier.
+
+52/52 tests passing (2 new offline tests covering the relevance gate and
+the domain-tier ranking, matching this suite's existing no-real-network/DB
+convention).
+
 ## Production verification found a real, separate retrieval limitation — not a Phase A defect
 
 Running one real end-to-end `/trip-plan` request against production

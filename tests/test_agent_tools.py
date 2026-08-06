@@ -9,8 +9,10 @@ import requests
 
 from agent.tools import (
     _coerce_limit,
+    _domain_tier,
     _fetch_and_cache_live_weather,
     _MAX_FORECAST_DAYS,
+    _mentions_copenhagen_or_denmark,
     haversine_km,
     place_details,
     search_place_live,
@@ -60,6 +62,27 @@ def test_live_weather_refuses_dates_beyond_open_meteos_real_forecast_horizon():
     too_far = date.today() + timedelta(days=_MAX_FORECAST_DAYS + 5)
     result = _fetch_and_cache_live_weather(conn=None, d=too_far)
     assert result is None
+
+
+def test_relevance_gate_requires_an_explicit_copenhagen_or_denmark_mention():
+    # Real problem this guards, not hypothetical: a live test against the
+    # generically-named landmark "Abstrakt skulptur" had Serper confidently
+    # return three e-commerce listings for decorative sculpture products —
+    # completely unrelated to the real place — because they only passed
+    # length/domain filtering, nothing about actual topical relevance.
+    assert _mentions_copenhagen_or_denmark("A statue in central Copenhagen, built in 1901.")
+    assert _mentions_copenhagen_or_denmark("Beliggende i hjertet af København.")
+    assert not _mentions_copenhagen_or_denmark("The Abstract Woman Sculpture adds elegance to any room.")
+
+
+def test_domain_tier_ranks_official_site_above_tourism_org_above_generic():
+    official = "restaurantaoc.dk"
+    assert _domain_tier("https://restaurantaoc.dk/en/about", official) == 0
+    assert _domain_tier("https://www.visitcopenhagen.com/copenhagen/x", official) == 1
+    assert _domain_tier("https://some-random-blog.example/review", official) == 2
+    # No official domain known for this place — tourism org still beats generic.
+    assert _domain_tier("https://www.wonderfulcopenhagen.dk/x", None) == 1
+    assert _domain_tier("https://some-random-blog.example/review", None) == 2
 
 
 def test_travel_time_estimate_without_a_start_point_says_so_without_hitting_the_network():

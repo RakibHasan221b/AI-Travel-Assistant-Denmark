@@ -351,6 +351,213 @@ def top_quality_places(category: str = "", neighborhood: str = "", limit: int | 
     )
 
 
+_WIKIPEDIA_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+_WIKIPEDIA_HEADERS = {"User-Agent": "ai-denmark-explorer/0.1 (Copenhagen pilot, personal project)"}
+_MIN_FALLBACK_TEXT_CHARS = 40
+
+
+def _mentions_copenhagen_or_denmark(text: str) -> bool:
+    """The relevance gate every live-fetched fallback text must pass before
+    being stored. Real problem this caught, not hypothetical: a live test
+    of a generically-named landmark ('Abstrakt skulptur' — Danish for
+    'abstract sculpture', not a unique proper noun) had its Serper results
+    confidently link three e-commerce listings for decorative sculpture
+    products — completely unrelated to the real Copenhagen public artwork —
+    because they only passed length/domain filtering, nothing about actual
+    topical relevance. Requiring an explicit Copenhagen/Denmark mention in
+    the text itself is a real, if imperfect, check: it won't catch every
+    false positive, but it directly would have rejected all three bad
+    results above. Applied identically to Wikipedia and Serper results so
+    neither source gets a looser bar than the other."""
+    lowered = text.lower()
+    return "copenhagen" in lowered or "denmark" in lowered or "københavn" in lowered
+
+
+def _wikipedia_summary(place_name: str) -> dict | None:
+    """Live, keyless, free Wikipedia REST API lookup for one place name —
+    used as the last-resort tier in _fetch_place_knowledge below, not the
+    first. Wikipedia is stable and factual, but real evidence from this
+    project's own testing shows it's a poor fit for a system whose job is
+    answering "why should I visit this place," not "what is this place":
+    a live test against 'Absalon' (a real Copenhagen landmark honoring the
+    historical bishop) correctly found a real, on-topic Wikipedia summary —
+    but it's a biography, not a description of the landmark or why a
+    traveler would visit, and the recommendation classifier scored it only
+    49%/"not recommended" partly as a result. Kept as a real fallback for
+    when nothing better exists, not the default answer.
+
+    Deliberately NOT Wikivoyage here — ingestion/wikivoyage_descriptions.py
+    already ran a full batch pass linking Wikivoyage's structured Copenhagen
+    listings against every curated place; a place reaching this live
+    fallback has already been checked against Wikivoyage and found nothing
+    there, so re-trying it live would just repeat a known-failed search.
+
+    Returns None (not an exception) for anything not confidently on-topic:
+    no page, a disambiguation page, or a summary that never even mentions
+    Copenhagen/Denmark."""
+    try:
+        resp = requests.get(
+            _WIKIPEDIA_SUMMARY_URL.format(title=place_name.replace(" ", "_")),
+            headers=_WIKIPEDIA_HEADERS,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    if data.get("type") == "disambiguation":
+        return None
+    extract = data.get("extract", "")
+    if len(extract) < _MIN_FALLBACK_TEXT_CHARS:
+        return None
+    if not _mentions_copenhagen_or_denmark(extract):
+        return None
+    return {
+        "title": data.get("title", place_name),
+        "text": extract,
+        "source_url": (data.get("content_urls", {}).get("desktop", {}) or {}).get("page")
+        or f"https://en.wikipedia.org/wiki/{place_name.replace(' ', '_')}",
+        "tier": "wikipedia",
+    }
+
+
+# Real Copenhagen tourism-organization domains — traveler-recommendation
+# focused ("why visit"), not encyclopedic ("what is it"), the actual gap
+# Wikipedia-only fallback left. Deliberately a short, hand-verified
+# allowlist rather than a heuristic guess at "looks official" — a wrong
+# match here would be worse than finding nothing.
+_TRUSTED_TOURISM_DOMAINS = ("visitcopenhagen.com", "wonderfulcopenhagen.dk")
+
+
+def _domain_tier(url: str, official_domain: str | None) -> int:
+    """Ranks a search result by source quality, lower is better. 0 = the
+    place's own official website (from OSM's real `website` tag on this
+    exact place — the strongest possible signal, not a guess); 1 = a known
+    Copenhagen tourism organization (traveler-focused by design); 2 =
+    everything else that already passed the relevance filter."""
+    if official_domain and official_domain in url:
+        return 0
+    if any(d in url for d in _TRUSTED_TOURISM_DOMAINS):
+        return 1
+    return 2
+
+
+def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: str | None) -> list[str]:
+    """Last-resort live enrichment — called ONLY when a curated place has
+    zero linked reviews_raw text (checked by the caller before this runs).
+    Not "Wikipedia fallback": the official site (when OSM's own `website`
+    tag names one) is searched directly first, then general Copenhagen
+    search results ranked by source quality (known tourism organizations
+    above generic snippets), and Wikipedia only fires if nothing above
+    found anything usable. This matches what the downstream task actually
+    needs: traveler-recommendation-oriented text, not an encyclopedia entry
+    (see _wikipedia_summary's docstring for the real evidence).
+
+    Real, live-tested reason the official-site check is a SEPARATE,
+    site-scoped search rather than just hoping it ranks well in general
+    results: tested against a real database record — a 1901 statue of
+    Bishop Absalon, whose OSM data already names its real official source
+    (samlingen.koes.dk, Copenhagen's public art registry) — a plain
+    "Absalon Copenhagen" search never surfaced that niche page at all,
+    instead ranking a popular, unrelated, same-named venue (a converted-
+    church community space) highly enough to look like a confident tourism-
+    org match. A `site:`-scoped search is what actually finds it.
+
+    Whatever's found is stored as an ordinary reviews_raw row, tagged with
+    which real tier it came from in raw_payload — so this place never needs
+    live enrichment again, and it's always possible to tell later whether a
+    description came from the official site, a tourism org, or a generic
+    snippet. Returns the newly found text so the CURRENT request can use it
+    immediately, not just the next one."""
+    from ingestion.web_enrichment import filter_results, search_web
+
+    found_texts: list[str] = []
+    run_id = f"live-fallback-{datetime.now().strftime('%Y%m%d-%H%M%S')}"  # noqa: DTZ005
+    official_domain = None
+    if official_website:
+        official_domain = official_website.split("//")[-1].split("/")[0].removeprefix("www.")
+
+    results = []
+    if official_domain:
+        try:
+            results = filter_results(search_web(f"site:{official_domain} {place_name}"))
+        except requests.exceptions.RequestException as e:
+            log.info(f"Live official-site search failed for {place_name!r}: {e}")
+        # A site:-scoped result is already confirmed on the place's own
+        # official domain — the general Copenhagen/Denmark relevance gate
+        # below would still reject a page that never happens to say either
+        # word (a real risk for a niche registry entry), so it's checked
+        # separately here rather than folded into the shared filter.
+        results = [r for r in results if official_domain in r["link"]]
+
+    if not results:
+        try:
+            general_results = filter_results(search_web(f"{place_name} Copenhagen"))
+        except requests.exceptions.RequestException as e:
+            log.info(f"Live Serper fallback failed for {place_name!r}: {e}")
+            general_results = []
+        # web_enrichment.filter_results only screens length/low-signal
+        # domains, not actual topical relevance — real, observed failure
+        # mode this closes: a generic place name (no unique proper noun)
+        # matching unrelated commercial results that just share descriptive
+        # words. See _mentions_copenhagen_or_denmark's docstring for the
+        # concrete case. Not applied to the official-site results above —
+        # a site:-scoped match is already confirmed on-domain, and a niche
+        # registry page (the real Absalon case) may never say "Copenhagen"
+        # explicitly even when it's exactly the right page.
+        results = [r for r in general_results if _mentions_copenhagen_or_denmark(r.get("snippet", ""))]
+    results.sort(key=lambda r: _domain_tier(r["link"], official_domain))
+
+    tier_names = {0: "official_site", 1: "tourism_org", 2: "search_snippet"}
+    with conn.cursor() as cur:
+        for r in results:
+            tier = _domain_tier(r["link"], official_domain)
+            payload = {**r, "tier": tier_names[tier]}
+            cur.execute(
+                """
+                INSERT INTO reviews_raw (place_id, source_type, source_id, source_url,
+                                          text_content, run_id, raw_payload)
+                VALUES (%s, 'web_search', %s, %s, %s, %s, %s) RETURNING review_id;
+                """,
+                (place_id, r.get("title", place_name), r["link"], r["snippet"], run_id, psycopg.types.json.Json(payload)),
+            )
+            review_id = cur.fetchone()[0]
+            cur.execute(
+                "INSERT INTO place_mentions (review_id, place_id, match_method, confidence) "
+                "VALUES (%s, %s, 'manual', 1.0);",
+                (review_id, place_id),
+            )
+            found_texts.append(r["snippet"])
+
+        if not found_texts:
+            wiki = _wikipedia_summary(place_name)
+            if wiki:
+                cur.execute(
+                    """
+                    INSERT INTO reviews_raw (place_id, source_type, source_id, source_url,
+                                              text_content, run_id, raw_payload)
+                    VALUES (%s, 'wikipedia', %s, %s, %s, %s, %s) RETURNING review_id;
+                    """,
+                    (place_id, wiki["title"], wiki["source_url"], wiki["text"], run_id, psycopg.types.json.Json(wiki)),
+                )
+                review_id = cur.fetchone()[0]
+                cur.execute(
+                    "INSERT INTO place_mentions (review_id, place_id, match_method, confidence) "
+                    "VALUES (%s, %s, 'manual', 1.0);",
+                    (review_id, place_id),
+                )
+                found_texts.append(wiki["text"])
+
+    conn.commit()
+    if found_texts:
+        log.info(f"{place_name!r}: live fallback found {len(found_texts)} new source(s)")
+    return found_texts
+
+
 @tool
 def place_details(place_names: str) -> str:
     """Looks up everything known about one or more Copenhagen places:
@@ -414,6 +621,17 @@ def place_details(place_names: str) -> str:
                 (place["place_id"],),
             )
             review_texts = [r[0] for r in cur.fetchall()]
+
+            # Last-resort live enrichment — only when this curated place
+            # genuinely has zero linked review text, never as a routine
+            # enrichment step for every place. Whatever's found is stored
+            # immediately (see _fetch_place_knowledge), so this branch only
+            # ever runs once per place for the app's whole lifetime — every
+            # later call sees non-empty review_texts above and skips
+            # straight past this.
+            if not review_texts:
+                official_website = (place["osm_tags"] or {}).get("website")
+                review_texts = _fetch_place_knowledge(conn, place["place_id"], place["name"], official_website)
 
             # Live recommendation score, replacing the old pre-computed
             # quality_score — computed fresh from this place's CURRENT raw
