@@ -288,9 +288,9 @@ def _respect_nominatim_rate_limit() -> None:
 def search_place_live(query: str) -> str:
     """Last-resort live lookup for a named place — use ONLY after
     search_places, search_places_near, and top_quality_places all found
-    nothing. Result has NO quality score, vibe cluster, or AI summary —
-    it's outside the curated dataset. Never present it with the same
-    confidence as a normal result."""
+    nothing. Result has NO recommendation confidence, vibe cluster, or AI
+    summary — it's outside the curated dataset. Never present it with the
+    same confidence as a normal result."""
     _respect_nominatim_rate_limit()
     try:
         resp = requests.get(
@@ -311,8 +311,8 @@ def search_place_live(query: str) -> str:
     name = r.get("name") or query
     address = r.get("display_name", "address unknown")
     return (
-        f"LIVE LOOKUP RESULT (not in our curated dataset — no quality score, "
-        f"vibe cluster, or AI summary available): {name}, {address}."
+        f"LIVE LOOKUP RESULT (not in our curated dataset — no recommendation "
+        f"confidence, vibe cluster, or AI summary available): {name}, {address}."
     )
 
 
@@ -561,8 +561,9 @@ def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: st
 @tool
 def place_details(place_names: str) -> str:
     """Looks up everything known about one or more Copenhagen places:
-    category, neighborhood, opening hours, quality score, vibe cluster,
-    rated aspects, and its RAG-grounded AI summary with cited sources.
+    category, neighborhood, opening hours, recommendation confidence,
+    vibe cluster, rated aspects, and its RAG-grounded AI summary with
+    cited sources.
     Pass ALL the places you need in ONE call, comma-separated (e.g. "Den
     lille Havfrue, Torvehallerne, Nyhavn") — never call this once per
     place, since each separate call resends the whole conversation so far

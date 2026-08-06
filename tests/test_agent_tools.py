@@ -138,8 +138,8 @@ def test_coerce_limit_falls_back_to_default_on_garbage():
 def test_search_place_live_flags_a_found_result_as_not_in_the_curated_dataset(monkeypatch):
     # Real problem this guards: a live-lookup result must never be mistaken
     # for a curated, scored place downstream — the agent's honesty about
-    # "no quality score" depends on this exact flag surviving in the string
-    # it reads.
+    # "no recommendation confidence" depends on this exact flag surviving
+    # in the string it reads.
     monkeypatch.setattr(
         requests, "get",
         lambda *a, **k: _FakeResponse([{"name": "Reffen", "display_name": "Reffen, Copenhagen, Denmark"}]),

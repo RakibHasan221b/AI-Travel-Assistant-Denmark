@@ -138,12 +138,14 @@ model matched the real outcome and the old one didn't.
 (`agent/tools.py`) now computes `recommendation_confidence` live on every
 call instead of reading `ml_predictions.quality_score` — the old value is
 still logged server-side for ongoing comparison, never shown to a
-traveler. `PlaceRecommendation.quality_score` (`agent/crew.py`) is kept as
-a deprecated `@computed_field` mirroring `recommendation_confidence`
-exactly, purely so the not-yet-updated frontend doesn't break — remove it
-once the frontend reads the new field directly. The Explore page and
-Stats Dashboard still read `ml_predictions.quality_score` directly and
-are explicitly out of scope for this change, not an oversight.
+traveler. `PlaceRecommendation.quality_score` (`agent/crew.py`) was kept
+briefly as a deprecated `@computed_field` mirror while the frontend still
+read the old name, then removed entirely once both the React and
+Streamlit Trip Planner UIs were updated — see "Frontend: retiring
+`quality_score` from the Trip Planner" below for that real cutover. The
+Explore page and Stats Dashboard still read `ml_predictions.quality_score`
+directly and are explicitly out of scope for this change, not an
+oversight.
 
 **DistilBERT relocated offline — real measurement forced this, not
 preference.** A staged `psutil` memory test found DistilBERT's live
@@ -314,8 +316,8 @@ convention).
 
 `web/lib/types.ts`'s `PlaceRecommendation` interface and
 `web/components/trip-planner/PlaceCard.tsx` were the only two places in
-the frontend actually reading `quality_score` for the Trip Planner path —
-confirmed by grepping the whole `web/` tree, not assumed. Both now use
+the **React** frontend actually reading `quality_score` for the Trip
+Planner path — confirmed by grepping the whole `web/` tree. Both now use
 `recommendation_confidence`/`recommendation_label` directly; the card
 shows "87% / RECOMMENDED" instead of "87/100 Quality", matching what the
 model actually claims (a live recommendation estimate, not an objective
@@ -324,12 +326,25 @@ separate `quality_score` fields untouched — the Explore page and Stats
 Dashboard still correctly read `ml_predictions.quality_score` directly, by
 design, unrelated to this rename.
 
-With the frontend no longer reading it, the deprecated `quality_score`
-mirror was removed from both `agent/crew.py`'s `PlaceRecommendation`
-(the `@computed_field` and its now-dead `computed_field` import) and
-`api/main.py`'s independently-declared response model — confirmed via a
-direct `model_dump()` check that `quality_score` no longer appears in the
-serialized output at all.
+With the React frontend no longer reading it, the deprecated
+`quality_score` mirror was removed from both `agent/crew.py`'s
+`PlaceRecommendation` (the `@computed_field` and its now-dead
+`computed_field` import) and `api/main.py`'s independently-declared
+response model — confirmed via a direct `model_dump()` check that
+`quality_score` no longer appears in the serialized output at all.
+
+**A real regression this created, caught by a later repo-wide sweep, not
+by any test:** this project has *two* real, live-deployed Trip Planner
+UIs (see the README's own two live links) — the React one, checked above,
+and the original Streamlit one (`app/pages/2_Trip_Planner.py`), which was
+never checked at the time. It read `place["quality_score"]` via direct
+dict-key access, calling the same `/trip-plan` endpoint — removing the
+mirror silently broke it (a real `KeyError` on any live request), and the
+existing 52-test suite never caught it, because this page had zero test
+coverage. Found and fixed in the same later sweep that caught the other
+stale `quality_score` wording below — a genuine reminder that "the
+frontend" can mean more than one deployed surface, and grepping one
+directory isn't the same as checking every real consumer.
 
 **Verified for real in a live browser, not just by reading the diff:**
 ran both a local FastAPI server and the Next.js dev server together,
