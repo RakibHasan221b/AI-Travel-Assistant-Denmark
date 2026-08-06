@@ -13,9 +13,9 @@ export default function Home() {
           Plan a real Copenhagen trip.
         </h1>
         <p className="text-lg text-ink-muted mb-8 max-w-prose">
-          Three AI agents collaborate live — a Place Scout, a Conditions
-          Analyst, and a Concierge — grounded in real places, real weather,
-          and a real quality score. Nothing invented.
+          Two AI agents collaborate live — a Place Scout and a Concierge —
+          grounded in real places, real weather, and a real recommendation
+          confidence. Nothing invented.
         </p>
         <Link
           href="/trip-planner"

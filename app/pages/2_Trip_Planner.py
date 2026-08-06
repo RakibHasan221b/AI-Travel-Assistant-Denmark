@@ -54,8 +54,11 @@ def render_trip_plan(result: dict) -> None:
         with st.container(border=True):
             header_col, score_col = st.columns([4, 1])
             header_col.markdown(f"**{place['name']}** — {place['category']}, {place['neighborhood']}")
-            if place["quality_score"] is not None:
-                score_col.metric("Quality", f"{place['quality_score']:.0f}/100")
+            if place["recommendation_confidence"] is not None:
+                score_col.metric(
+                    place.get("recommendation_label") or "Confidence",
+                    f"{place['recommendation_confidence']:.0f}%",
+                )
 
             meta_bits = []
             if place.get("vibe_cluster"):

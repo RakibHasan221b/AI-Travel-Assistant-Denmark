@@ -71,10 +71,11 @@ class TripPlanResponse(BaseModel):
     independently rather than imported — this module shouldn't need to know
     about crew.py's internal schema class, only the plain dict plan_trip()
     returns. Structured on purpose, not a single prose string: the frontend
-    renders this as cards (quality score, distance, weather) instead of
-    asking the LLM to "format nicely," which costs zero extra tokens and is
-    actually more reliable than hoping the model produces good layout in
-    free text — see docs/technique_map.md for the full before/after story."""
+    renders this as cards (recommendation confidence, distance, weather)
+    instead of asking the LLM to "format nicely," which costs zero extra
+    tokens and is actually more reliable than hoping the model produces
+    good layout in free text — see docs/technique_map.md for the full
+    before/after story."""
 
     places: list[PlaceRecommendation]
     weather_summary: str
