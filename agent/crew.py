@@ -26,7 +26,7 @@ import psycopg
 import requests
 from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from agent.tools import (
     haversine_km,
@@ -126,12 +126,12 @@ class PlaceRecommendation(BaseModel):
     # no review text) correlated weakly with real outcomes (r=0.171). The
     # model that replaced it (DistilBERT + MiniLM sentiment signals plus
     # structured features, computed live from a place's current review
-    # text, never a stored number) correlated far more strongly (r=0.668) —
+    # text, never a stored number) correlated far more strongly (r=0.713) —
     # but it estimates "how likely is this place to be a good
     # recommendation," not an objective quality rating, so the field name
     # needed to say that honestly instead of implying a precision the model
-    # doesn't have. quality_score is kept, deprecated, mirroring the same
-    # value, only so the not-yet-updated frontend doesn't break.
+    # doesn't have. The deprecated quality_score mirror that used to live
+    # here has been removed now that the frontend reads this field directly.
     recommendation_confidence: float | None = Field(
         None, description="0-100, from place_details' live recommendation model — null if no review text was available"
     )
@@ -161,6 +161,22 @@ class PlaceRecommendation(BaseModel):
         "traveler's own starting point, not from another recommended place. Null if near_place is null.",
     )
     why_recommended: str = Field(description="1-2 sentences on why this place fits the request")
+
+    @field_validator("category", "neighborhood", mode="before")
+    @classmethod
+    def _coerce_null_category_and_neighborhood(cls, v, info):
+        # Found live: Groq/Llama sometimes emits an explicit `null` for
+        # category/neighborhood instead of the real value place_details
+        # returned — likely for a place found only via search_place_live,
+        # which doesn't carry a curated category. An explicit None crashes
+        # the whole trip plan with a real ValidationError (str fields don't
+        # accept it even with a default, since default only fills a
+        # genuinely *missing* key). Same fix category as _coerce_null_sources
+        # above: repair the one point the model's actual output is wrong,
+        # rather than hoping the prompt prevents it every time.
+        if v is not None:
+            return v
+        return "unknown area" if info.field_name == "neighborhood" else "place"
 
     @field_validator("sources", mode="before")
     @classmethod
@@ -192,14 +208,6 @@ class PlaceRecommendation(BaseModel):
         if isinstance(v, str) and v.strip().lower() in _PLACEHOLDER_VALUES:
             return None
         return v
-
-    @computed_field
-    @property
-    def quality_score(self) -> float | None:
-        """Deprecated — mirrors recommendation_confidence exactly. Exists
-        only so the not-yet-updated frontend doesn't break; remove once
-        the frontend reads recommendation_confidence directly instead."""
-        return self.recommendation_confidence
 
 
 class TripPlanOutput(BaseModel):
@@ -344,7 +352,13 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "for places found any other way.\n\n"
             "weather_summary: required, 1-2 sentences from your own weather_conditions call. "
             "overall_note: required, 2-4 sentences tying the recommendation together like a real "
-            "concierge speaking — never empty.\n\n"
+            "concierge speaking — never empty. Weave the real weather from weather_conditions and "
+            "the real distance/travel time from travel_time_estimate (if a starting point was "
+            "given) naturally into this note as plain, warm sentences — 'it'll be a sunny "
+            "22 degrees, an easy 15-minute walk from your hotel', not a separate report. If weather "
+            "or distance genuinely couldn't be determined, simply don't mention it — never say "
+            "'the weather forecast is not available' or similar; an omission reads as normal "
+            "conversation, an announced gap reads as a system apologizing for itself.\n\n"
             "Traveler's starting point: {start_location}. If given (not 'not provided'), call "
             "travel_time_estimate ONCE with every place name comma-separated (same rule as "
             "place_details — one call, not one per place) and fill distance_km/walk_minutes/"

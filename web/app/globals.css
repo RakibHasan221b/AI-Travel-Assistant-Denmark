@@ -30,6 +30,18 @@
   --chart-3: #1baf7a;
   --chart-4: #eda100;
   --chart-5: #e87ba4;
+
+  /* Status palette — fixed, reserved meaning (recommendation-confidence
+     band on the trip-planner ring), never themed or reused as a chart
+     series. Steps deliberately distinct from --accent/--chart-* so a
+     status color never impersonates a series or the app's own accent.
+     Always paired with an icon/label in the UI, never color alone —
+     warning is intentionally sub-3:1 on the light surface by design;
+     the confidence number stays in --ink, never colored, and the
+     recommendation label text is the real signal. */
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -72,6 +84,9 @@
   --color-chart-3: var(--chart-3);
   --color-chart-4: var(--chart-4);
   --color-chart-5: var(--chart-5);
+  --color-good: var(--good);
+  --color-warning: var(--warning);
+  --color-critical: var(--critical);
   --font-sans: var(--font-display);
   --font-mono: var(--font-data);
 }
