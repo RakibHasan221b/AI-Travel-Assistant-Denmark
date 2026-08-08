@@ -36,10 +36,12 @@ keeps it at one instance/one connection pattern instead of a second,
 memory-doubling copy in a second "private" module.
 """
 
+import functools
 import logging
 import math
 import os
 import time
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -65,6 +67,48 @@ _trip_start: dict = {"lat": None, "lon": None, "label": None}
 
 def set_trip_start(lat: float | None, lon: float | None, label: str) -> None:
     _trip_start["lat"], _trip_start["lon"], _trip_start["label"] = lat, lon, label
+
+
+# Per-request memoization for tool calls — a real, deterministic backstop
+# against wasted repeated work within one plan_trip() run, independent of
+# whether an agent's own reasoning ever decides to stop asking for the
+# same thing twice. Reset at the start of every plan_trip() call (see
+# agent/crew.py), not persisted across requests — this is about one
+# run's redundant calls, not a cross-request cache (weather_daily/
+# reviews_raw already handle real cross-request caching where it matters).
+_tool_call_cache: dict[tuple, str] = {}
+
+
+def reset_tool_call_cache() -> None:
+    _tool_call_cache.clear()
+
+
+def get_cached_tool_calls(fn_name: str) -> list[dict]:
+    """The kwargs of every call to the named tool that this request has
+    already made and cached (see _tool_call_cache above) — used by
+    agent/crew.py's Groq-failure cache-reuse path to recover which places a
+    partially-completed crew run had already resolved, without that module
+    reaching into _tool_call_cache's internal (fn_name, sorted kwargs)
+    tuple-key structure directly."""
+    return [dict(key[1]) for key in _tool_call_cache if key[0] == fn_name]
+
+
+def _cache_tool_calls(fn):
+    """Wraps a tool's real implementation (applied BELOW @tool, so @tool
+    still introspects the original signature/docstring — verified this
+    survives functools.wraps correctly) — identical (tool, kwargs) calls
+    within the same request return the cached result instead of repeating
+    a real DB query or live web fetch."""
+    @functools.wraps(fn)
+    def wrapper(**kwargs):
+        key = (fn.__name__, tuple(sorted(kwargs.items())))
+        if key in _tool_call_cache:
+            log.info(f"{fn.__name__}({kwargs}): identical call already made this request, reusing result")
+            return _tool_call_cache[key]
+        result = fn(**kwargs)
+        _tool_call_cache[key] = result
+        return result
+    return wrapper
 
 
 # search_places_near always returned its closest N candidates regardless of
@@ -191,16 +235,28 @@ def _search_places_rows(query: str, category: str = "", neighborhood: str = "", 
     deterministic_trip_plan() (used when Groq is confirmed unavailable —
     see that function's docstring) can get real candidate places without
     going through the @tool/LLM-calling layer at all. search_places()
-    below is now a thin text-formatting wrapper around this."""
+    below is now a thin text-formatting wrapper around this.
+
+    Real gap this used to have, same class as the one already fixed for
+    /explore: raw "ORDER BY embedding <=> qvec LIMIT n" treats every
+    result in the requested limit as equally relevant. Pulls a wider pool
+    than what's requested and reranks with api.ranking's deterministic
+    layer (real lexical name matching + category-intent detection, not
+    semantic similarity alone) before capping to the caller's limit — so
+    BOTH the normal Scout-driven path (search_places) and the Groq-
+    unavailable deterministic fallback get the same relevance quality,
+    not just Explore."""
+    from api.ranking import DEFAULT_POOL_SIZE, rank_explore_candidates
+
     model = get_embed_model()
     query_embedding = next(model.embed([query]))
     sql = """
-        SELECT name, category, neighborhood, opening_hours, lat, lon,
+        SELECT name, category, subcategory, neighborhood, opening_hours, lat, lon,
                1 - (embedding <=> %(qvec)s) AS similarity
         FROM places
         WHERE embedding IS NOT NULL
     """
-    params = {"qvec": query_embedding, "limit": _coerce_limit(limit)}
+    params = {"qvec": query_embedding, "limit": DEFAULT_POOL_SIZE}
     if category:
         sql += " AND category = %(category)s"
         params["category"] = category
@@ -212,10 +268,13 @@ def _search_places_rows(query: str, category: str = "", neighborhood: str = "", 
     with connect() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         columns = [d.name for d in cur.description]
-        return [dict(zip(columns, r)) for r in cur.fetchall()]
+        rows = [dict(zip(columns, r)) for r in cur.fetchall()]
+
+    return rank_explore_candidates(query, rows, final_limit=_coerce_limit(limit))
 
 
 @tool
+@_cache_tool_calls
 def search_places(query: str, category: str = "", neighborhood: str = "", limit: int | str = 5) -> str:
     """Semantic search over Copenhagen places (pgvector). Use this to find
     candidate places matching a vibe or description, e.g. "cozy quiet cafe
@@ -231,7 +290,33 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
     )
 
 
+def _places_near(cur, lat: float, lon: float, category: str = "", exclude_name: str | None = None, limit: int = 3) -> list[dict]:
+    """Real places within MAX_NEARBY_KM of (lat, lon), sorted by actual
+    haversine distance — the shared core of search_places_near() below,
+    factored out so agent/crew.py's deterministic_trip_plan() can rank
+    "near X" candidates by real geographic distance FROM A NAMED PLACE
+    (never from the traveler's own start_location, and never by semantic
+    similarity) without going through the @tool/LLM-calling layer."""
+    sql = "SELECT name, category, neighborhood, opening_hours, lat, lon FROM places WHERE lat IS NOT NULL AND lon IS NOT NULL"
+    params: dict = {}
+    if exclude_name:
+        sql += " AND lower(name) != lower(%(exclude_name)s)"
+        params["exclude_name"] = exclude_name
+    if category:
+        sql += " AND category = %(category)s"
+        params["category"] = category
+    cur.execute(sql, params)
+    columns = [d.name for d in cur.description]
+    rows = [dict(zip(columns, r)) for r in cur.fetchall()]
+
+    for r in rows:
+        r["distance_km"] = haversine_km(lat, lon, r["lat"], r["lon"])
+    rows.sort(key=lambda r: r["distance_km"])
+    return [r for r in rows if r["distance_km"] <= MAX_NEARBY_KM][:limit]
+
+
 @tool
+@_cache_tool_calls
 def search_places_near(anchor_place: str, category: str = "", limit: int | str = 3) -> str:
     """Finds real places near ANOTHER named place, ranked by actual
     geographic distance — not text/semantic similarity, which only
@@ -247,20 +332,7 @@ def search_places_near(anchor_place: str, category: str = "", limit: int | str =
         if not anchor:
             return f"No place found matching '{anchor_place}' to search near."
         anchor_id, anchor_name, anchor_lat, anchor_lon = anchor
-
-        sql = "SELECT name, category, neighborhood, opening_hours, lat, lon FROM places WHERE place_id != %(anchor_id)s"
-        params = {"anchor_id": anchor_id}
-        if category:
-            sql += " AND category = %(category)s"
-            params["category"] = category
-        cur.execute(sql, params)
-        columns = [d.name for d in cur.description]
-        rows = [dict(zip(columns, r)) for r in cur.fetchall()]
-
-    for r in rows:
-        r["distance_km"] = haversine_km(anchor_lat, anchor_lon, r["lat"], r["lon"])
-    rows.sort(key=lambda r: r["distance_km"])
-    rows = [r for r in rows if r["distance_km"] <= MAX_NEARBY_KM][:limit]
+        rows = _places_near(cur, anchor_lat, anchor_lon, category=category, exclude_name=anchor_name, limit=limit)
 
     if not rows:
         scope = f" in category '{category}'" if category else ""
@@ -292,13 +364,111 @@ def _respect_nominatim_rate_limit() -> None:
     _last_live_lookup = time.time()
 
 
+# A real place Nominatim resolves might already be a curated place under
+# different wording ("The Little Mermaid" vs the DB's own "Den lille
+# Havfrue") — verified live: Nominatim's real osm_id for that landmark
+# (node/25074274) matches the curated row's osm_id exactly, same
+# coordinates. Checked first, since it's a perfect identity match when
+# available; ~50m is generous enough to absorb real GPS/geocoding jitter
+# for results Nominatim resolves without a clean OSM id, tight enough not
+# to match a genuinely different nearby place.
+_COORD_MATCH_RADIUS_KM = 0.05
+
+
+def _find_curated_match(cur, osm_type: str | None, osm_id: int | None, lat: float, lon: float) -> tuple | None:
+    """Returns (place_id, name) if a live Nominatim result is actually
+    already a curated place, else None."""
+    if osm_type and osm_id:
+        cur.execute("SELECT place_id, name FROM places WHERE osm_id = %s LIMIT 1;", (f"{osm_type}/{osm_id}",))
+        row = cur.fetchone()
+        if row:
+            return row
+
+    lat_delta = _COORD_MATCH_RADIUS_KM / 111.0  # ~km per degree of latitude
+    lon_delta = _COORD_MATCH_RADIUS_KM / (111.0 * math.cos(math.radians(lat)) or 1.0)
+    cur.execute(
+        "SELECT place_id, name, lat, lon FROM places "
+        "WHERE lat BETWEEN %s AND %s AND lon BETWEEN %s AND %s;",
+        (lat - lat_delta, lat + lat_delta, lon - lon_delta, lon + lon_delta),
+    )
+    for place_id, name, plat, plon in cur.fetchall():
+        if haversine_km(lat, lon, plat, plon) <= _COORD_MATCH_RADIUS_KM:
+            return (place_id, name)
+    return None
+
+
+# Best-effort, deliberately conservative mapping from Nominatim's real OSM
+# category/type taxonomy to this project's five-category taxonomy — real,
+# not guessed, but genuinely imperfect (OSM's tagging vocabulary is much
+# richer than five buckets), which is exactly why a live-discovered place
+# is marked data_status='live_discovered' rather than blended silently
+# into curated data. A (category, type) pair not listed here returns None
+# — callers must treat that as "can't safely persist this," not fall back
+# to a guessed default category just to make a row insertable, since the
+# category one-hot is a real model feature, not cosmetic.
+_NOMINATIM_CATEGORY_MAP = {
+    ("amenity", "restaurant"): "restaurant", ("amenity", "fast_food"): "restaurant",
+    ("amenity", "cafe"): "cafe",
+    ("amenity", "bar"): "bar", ("amenity", "pub"): "bar", ("amenity", "biergarten"): "bar",
+    ("tourism", "hotel"): "hotel", ("tourism", "guest_house"): "hotel", ("tourism", "hostel"): "hotel",
+    ("tourism", "attraction"): "landmark", ("tourism", "artwork"): "landmark",
+    ("tourism", "museum"): "landmark", ("tourism", "gallery"): "landmark",
+}
+_NOMINATIM_CATEGORY_CLASS_FALLBACK = {"historic": "landmark", "leisure": "landmark"}
+
+
+def _map_nominatim_category(category: str, place_type: str) -> str | None:
+    mapped = _NOMINATIM_CATEGORY_MAP.get((category, place_type))
+    if mapped:
+        return mapped
+    return _NOMINATIM_CATEGORY_CLASS_FALLBACK.get(category)
+
+
+def _discover_live_place(conn, resolved_name: str, mapped_category: str, lat: float, lon: float, osm_type: str | None, osm_id: int | None) -> tuple[str, list[str]] | None:
+    """A place Nominatim resolved that is genuinely new — no curated match
+    even by coordinates. Real evidence is gathered FIRST, with no DB write
+    at all; a new places row is only ever inserted once that evidence
+    search actually found something, matching the explicit requirement not
+    to blindly persist every Nominatim hit. Returns (place_id, review
+    texts) on success, or None if no usable evidence was found — callers
+    must report that honestly as insufficient evidence, not silently
+    proceed to a zero-evidence prediction."""
+    evidence = _search_place_evidence(resolved_name, official_website=None)
+    if not evidence:
+        return None
+
+    osm_id_str = f"{osm_type}/{osm_id}" if osm_type and osm_id else f"live/{uuid.uuid4()}"
+    model = get_embed_model()
+    embedding = next(model.embed([resolved_name]))
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO places (osm_id, name, category, lat, lon, embedding, data_status, source_url)
+            VALUES (%s, %s, %s, %s, %s, %s, 'live_discovered', %s)
+            RETURNING place_id;
+            """,
+            (osm_id_str, resolved_name, mapped_category, lat, lon, embedding, evidence[0]["link"]),
+        )
+        place_id = cur.fetchone()[0]
+        found_texts = _store_place_evidence(cur, place_id, resolved_name, evidence)
+    conn.commit()
+    log.info(f"{resolved_name!r}: discovered live, persisted as a new place ({len(found_texts)} evidence source(s))")
+    return str(place_id), found_texts
+
+
 @tool
+@_cache_tool_calls
 def search_place_live(query: str) -> str:
     """Last-resort live lookup for a named place — use ONLY after
     search_places, search_places_near, and top_quality_places all found
-    nothing. Result has NO recommendation confidence, vibe cluster, or AI
-    summary — it's outside the curated dataset. Never present it with the
-    same confidence as a normal result."""
+    nothing. Checks whether the resolved place is actually already
+    curated under different wording (use place_details for it as normal
+    if so); otherwise attempts to discover and score it from real web
+    evidence. If that succeeds, it now has a real recommendation
+    confidence — call place_details for it like any other place. If
+    evidence genuinely can't be found, says so honestly; never presents an
+    invented or default confidence."""
     _respect_nominatim_rate_limit()
     try:
         resp = requests.get(
@@ -318,13 +488,45 @@ def search_place_live(query: str) -> str:
     r = results[0]
     name = r.get("name") or query
     address = r.get("display_name", "address unknown")
+    lat, lon = float(r["lat"]), float(r["lon"])
+    osm_type, osm_id = r.get("osm_type"), r.get("osm_id")
+
+    with connect() as conn, conn.cursor() as cur:
+        curated = _find_curated_match(cur, osm_type, osm_id, lat, lon)
+        if curated:
+            _, curated_name = curated
+            return (
+                f"'{query}' is already in our curated database as '{curated_name}' — "
+                f"call place_details for '{curated_name}' to get its real recommendation "
+                "confidence, vibe cluster, and AI summary; do not treat this as a live-only result."
+            )
+
+        mapped_category = _map_nominatim_category(r.get("category", ""), r.get("type", ""))
+        if not mapped_category:
+            return (
+                f"LIVE LOOKUP RESULT (not in our curated dataset, category unclear — no "
+                f"recommendation confidence, vibe cluster, or AI summary available): {name}, {address}."
+            )
+
+        discovered = _discover_live_place(conn, name, mapped_category, lat, lon, osm_type, osm_id)
+
+    if discovered is None:
+        return (
+            f"LIVE LOOKUP RESULT (not in our curated dataset, and no real review/evidence "
+            f"text could be found for it — no recommendation confidence available; treat as "
+            f"unscored, do not invent a confidence): {name}, {address}."
+        )
+
+    _, found_texts = discovered
     return (
-        f"LIVE LOOKUP RESULT (not in our curated dataset — no recommendation "
-        f"confidence, vibe cluster, or AI summary available): {name}, {address}."
+        f"'{query}' was found and added to our database as '{name}' — real evidence was found "
+        f"({len(found_texts)} source(s)) and a real recommendation confidence is now available. "
+        f"Call place_details for '{name}' to get it."
     )
 
 
 @tool
+@_cache_tool_calls
 def top_quality_places(category: str = "", neighborhood: str = "", limit: int | str = 5) -> str:
     """Ranks Copenhagen places by predicted quality score (0-100, Phase 9
     XGBoost model), optionally filtered by category and/or neighborhood. Use
@@ -454,16 +656,19 @@ def _domain_tier(url: str, official_domain: str | None) -> int:
     return 2
 
 
-def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: str | None) -> list[str]:
-    """Last-resort live enrichment — called ONLY when a curated place has
-    zero linked reviews_raw text (checked by the caller before this runs).
-    Not "Wikipedia fallback": the official site (when OSM's own `website`
-    tag names one) is searched directly first, then general Copenhagen
-    search results ranked by source quality (known tourism organizations
-    above generic snippets), and Wikipedia only fires if nothing above
-    found anything usable. This matches what the downstream task actually
-    needs: traveler-recommendation-oriented text, not an encyclopedia entry
-    (see _wikipedia_summary's docstring for the real evidence).
+def _search_place_evidence(place_name: str, official_website: str | None) -> list[dict]:
+    """The real, place-specific evidence search — site-scoped official
+    search first, then general Copenhagen-scoped search ranked by source
+    quality (known tourism organizations above generic snippets), then
+    Wikipedia only if nothing above found anything usable. Pure: no DB
+    access, no side effects, so both the curated-place enrichment path
+    (_fetch_place_knowledge, below) and agent/crew.py's live-discovery
+    path (_discover_live_place) share this exact search behavior instead
+    of two copies that could drift apart. Returns a list of dicts with at
+    least title/link/snippet/tier/source_type — empty if nothing was found
+    or every provider call failed; callers are responsible for treating
+    that honestly (no evidence found is a real, valid outcome, not an
+    error to retry).
 
     Real, live-tested reason the official-site check is a SEPARATE,
     site-scoped search rather than just hoping it ranks well in general
@@ -473,18 +678,9 @@ def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: st
     "Absalon Copenhagen" search never surfaced that niche page at all,
     instead ranking a popular, unrelated, same-named venue (a converted-
     church community space) highly enough to look like a confident tourism-
-    org match. A `site:`-scoped search is what actually finds it.
-
-    Whatever's found is stored as an ordinary reviews_raw row, tagged with
-    which real tier it came from in raw_payload — so this place never needs
-    live enrichment again, and it's always possible to tell later whether a
-    description came from the official site, a tourism org, or a generic
-    snippet. Returns the newly found text so the CURRENT request can use it
-    immediately, not just the next one."""
+    org match. A `site:`-scoped search is what actually finds it."""
     from ingestion.web_enrichment import filter_results, search_web
 
-    found_texts: list[str] = []
-    run_id = f"live-fallback-{datetime.now().strftime('%Y%m%d-%H%M%S')}"  # noqa: DTZ005
     official_domain = None
     if official_website:
         official_domain = official_website.split("//")[-1].split("/")[0].removeprefix("www.")
@@ -506,7 +702,7 @@ def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: st
         try:
             general_results = filter_results(search_web(f"{place_name} Copenhagen"))
         except requests.exceptions.RequestException as e:
-            log.info(f"Live Serper fallback failed for {place_name!r}: {e}")
+            log.info(f"Live Serper search failed for {place_name!r}: {e}")
             general_results = []
         # web_enrichment.filter_results only screens length/low-signal
         # domains, not actual topical relevance — real, observed failure
@@ -518,48 +714,62 @@ def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: st
         # registry page (the real Absalon case) may never say "Copenhagen"
         # explicitly even when it's exactly the right page.
         results = [r for r in general_results if _mentions_copenhagen_or_denmark(r.get("snippet", ""))]
-    results.sort(key=lambda r: _domain_tier(r["link"], official_domain))
 
     tier_names = {0: "official_site", 1: "tourism_org", 2: "search_snippet"}
+    evidence = [
+        {**r, "source_type": "web_search", "tier": tier_names[_domain_tier(r["link"], official_domain)]}
+        for r in sorted(results, key=lambda r: _domain_tier(r["link"], official_domain))
+    ]
+
+    if not evidence:
+        wiki = _wikipedia_summary(place_name)
+        if wiki:
+            evidence = [{
+                "title": wiki["title"], "link": wiki["source_url"], "snippet": wiki["text"],
+                "source_type": "wikipedia", "tier": "wikipedia",
+            }]
+    return evidence
+
+
+def _store_place_evidence(cur, place_id, place_name: str, evidence: list[dict]) -> list[str]:
+    """Writes already-fetched evidence (from _search_place_evidence) as
+    real reviews_raw rows tied to place_id. Split out from
+    _fetch_place_knowledge so a caller that already has evidence in hand
+    (the live-discovery path below) doesn't need to search Serper twice
+    for the same place."""
+    run_id = f"live-fallback-{datetime.now().strftime('%Y%m%d-%H%M%S')}"  # noqa: DTZ005
+    found_texts: list[str] = []
+    for e in evidence:
+        cur.execute(
+            """
+            INSERT INTO reviews_raw (place_id, source_type, source_id, source_url,
+                                      text_content, run_id, raw_payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING review_id;
+            """,
+            (place_id, e["source_type"], e.get("title", place_name), e["link"], e["snippet"], run_id, psycopg.types.json.Json(e)),
+        )
+        review_id = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO place_mentions (review_id, place_id, match_method, confidence) "
+            "VALUES (%s, %s, 'manual', 1.0);",
+            (review_id, place_id),
+        )
+        found_texts.append(e["snippet"])
+    return found_texts
+
+
+def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: str | None) -> list[str]:
+    """Last-resort live enrichment — called ONLY when a curated place has
+    zero linked reviews_raw text (checked by the caller before this runs).
+    Whatever _search_place_evidence finds is stored tagged with which real
+    tier it came from in raw_payload — so this place never needs live
+    enrichment again, and it's always possible to tell later whether a
+    description came from the official site, a tourism org, or a generic
+    snippet/Wikipedia. Returns the newly found text so the CURRENT request
+    can use it immediately, not just the next one."""
+    evidence = _search_place_evidence(place_name, official_website)
     with conn.cursor() as cur:
-        for r in results:
-            tier = _domain_tier(r["link"], official_domain)
-            payload = {**r, "tier": tier_names[tier]}
-            cur.execute(
-                """
-                INSERT INTO reviews_raw (place_id, source_type, source_id, source_url,
-                                          text_content, run_id, raw_payload)
-                VALUES (%s, 'web_search', %s, %s, %s, %s, %s) RETURNING review_id;
-                """,
-                (place_id, r.get("title", place_name), r["link"], r["snippet"], run_id, psycopg.types.json.Json(payload)),
-            )
-            review_id = cur.fetchone()[0]
-            cur.execute(
-                "INSERT INTO place_mentions (review_id, place_id, match_method, confidence) "
-                "VALUES (%s, %s, 'manual', 1.0);",
-                (review_id, place_id),
-            )
-            found_texts.append(r["snippet"])
-
-        if not found_texts:
-            wiki = _wikipedia_summary(place_name)
-            if wiki:
-                cur.execute(
-                    """
-                    INSERT INTO reviews_raw (place_id, source_type, source_id, source_url,
-                                              text_content, run_id, raw_payload)
-                    VALUES (%s, 'wikipedia', %s, %s, %s, %s, %s) RETURNING review_id;
-                    """,
-                    (place_id, wiki["title"], wiki["source_url"], wiki["text"], run_id, psycopg.types.json.Json(wiki)),
-                )
-                review_id = cur.fetchone()[0]
-                cur.execute(
-                    "INSERT INTO place_mentions (review_id, place_id, match_method, confidence) "
-                    "VALUES (%s, %s, 'manual', 1.0);",
-                    (review_id, place_id),
-                )
-                found_texts.append(wiki["text"])
-
+        found_texts = _store_place_evidence(cur, place_id, place_name, evidence)
     conn.commit()
     if found_texts:
         log.info(f"{place_name!r}: live fallback found {len(found_texts)} new source(s)")
@@ -711,6 +921,7 @@ _MAX_PLACE_DETAILS_BATCH = 8
 
 
 @tool
+@_cache_tool_calls
 def place_details(place_names: str) -> str:
     """Looks up everything known about one or more Copenhagen places:
     category, neighborhood, opening hours, recommendation confidence,
@@ -779,6 +990,7 @@ def place_details(place_names: str) -> str:
 
 
 @tool
+@_cache_tool_calls
 def travel_time_estimate(place_names: str) -> str:
     """Estimates straight-line distance and walk/bike time from the
     traveler's starting point to one or more named places. Pass ALL the
@@ -998,6 +1210,7 @@ _WEATHER_ERROR_MESSAGES = {
 
 
 @tool
+@_cache_tool_calls
 def weather_conditions(target_date: str, category: str = "") -> str:
     """Weather and outdoor-interest conditions for one date (YYYY-MM-DD),
     optionally scoped to a place category (restaurant, cafe, hotel,

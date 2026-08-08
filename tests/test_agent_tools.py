@@ -10,9 +10,14 @@ import requests
 from agent.tools import (
     _MAX_FORECAST_DAYS,
     _coerce_limit,
+    _discover_live_place,
     _domain_tier,
     _fetch_and_cache_live_weather,
+    _find_curated_match,
+    _lookup_place_structured,
+    _map_nominatim_category,
     _mentions_copenhagen_or_denmark,
+    connect,
     haversine_km,
     place_details,
     search_place_live,
@@ -234,10 +239,16 @@ def test_search_place_live_flags_a_found_result_as_not_in_the_curated_dataset(mo
     # Real problem this guards: a live-lookup result must never be mistaken
     # for a curated, scored place downstream — the agent's honesty about
     # "no recommendation confidence" depends on this exact flag surviving
-    # in the string it reads.
+    # in the string it reads. No category/type in this mock (unlike a real
+    # Nominatim response) — deliberately exercises the "category unclear,
+    # can't safely persist" branch, not full live discovery, keeping this
+    # test's scope narrow and DB-free.
     monkeypatch.setattr(
         requests, "get",
-        lambda *a, **k: _FakeResponse([{"name": "Reffen", "display_name": "Reffen, Copenhagen, Denmark"}]),
+        lambda *a, **k: _FakeResponse([{
+            "name": "Reffen", "display_name": "Reffen, Copenhagen, Denmark",
+            "lat": "55.6989", "lon": "12.6122",
+        }]),
     )
     result = search_place_live.run(query="Reffen")
     assert "not in our curated dataset" in result
@@ -257,3 +268,237 @@ def test_search_place_live_handles_a_network_error_without_crashing(monkeypatch)
     monkeypatch.setattr(requests, "get", _raise)
     result = search_place_live.run(query="Christiania")
     assert "Live lookup failed" in result
+
+
+def test_map_nominatim_category_maps_known_amenity_and_tourism_pairs():
+    assert _map_nominatim_category("amenity", "cafe") == "cafe"
+    assert _map_nominatim_category("amenity", "restaurant") == "restaurant"
+    assert _map_nominatim_category("amenity", "bar") == "bar"
+    assert _map_nominatim_category("tourism", "hotel") == "hotel"
+    assert _map_nominatim_category("tourism", "artwork") == "landmark"
+
+
+def test_map_nominatim_category_falls_back_by_class_for_historic_and_leisure():
+    assert _map_nominatim_category("historic", "monument") == "landmark"
+    assert _map_nominatim_category("leisure", "park") == "landmark"
+
+
+def test_map_nominatim_category_returns_none_for_an_unmapped_pair():
+    # Real requirement this guards: never guess a default category just to
+    # make a row insertable — category is a real model feature, and an
+    # unmapped OSM type (e.g. a shop) has no confident answer.
+    assert _map_nominatim_category("shop", "bakery") is None
+
+
+def test_find_curated_match_finds_the_real_little_mermaid_by_exact_osm_id():
+    # Real, live-verified case: Nominatim's own real osm_id for "The
+    # Little Mermaid" (node/25074274) is the exact same osm_id the
+    # curated database already stores for "Den lille Havfrue" — a real
+    # entity match a coordinate/name heuristic wouldn't need to guess at.
+    with connect() as conn, conn.cursor() as cur:
+        match = _find_curated_match(cur, "node", 25074274, 55.6928661, 12.5992896)
+    assert match is not None
+    assert match[1] == "Den lille Havfrue"
+
+
+def test_find_curated_match_returns_none_far_from_any_curated_place():
+    with connect() as conn, conn.cursor() as cur:
+        match = _find_curated_match(cur, None, None, 0.0, 0.0)  # middle of the ocean
+    assert match is None
+
+
+def _cleanup_discovered_place(place_id) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT review_id FROM reviews_raw WHERE place_id = %s;", (place_id,))
+        for (review_id,) in cur.fetchall():
+            cur.execute("DELETE FROM place_mentions WHERE review_id = %s;", (review_id,))
+        cur.execute("DELETE FROM reviews_raw WHERE place_id = %s;", (place_id,))
+        cur.execute("DELETE FROM places WHERE place_id = %s;", (place_id,))
+        conn.commit()
+
+
+def test_discover_live_place_persists_and_scores_when_real_evidence_is_found(monkeypatch):
+    # Core requirement B: a new place with fresh review data receives a
+    # real ML score computed through the exact same pipeline as any
+    # curated place — not an LLM-generated or invented number.
+    import ingestion.web_enrichment as web_enrichment
+
+    monkeypatch.setattr(
+        web_enrichment, "search_web",
+        lambda q: [{
+            "title": "Test Discovery Place - Copenhagen guide",
+            "link": "https://example.com/test-discovery-place",
+            "snippet": "A wonderful test venue in Copenhagen with great reviews and a cozy, welcoming atmosphere for everyone.",
+        }],
+    )
+
+    place_id = None
+    try:
+        with connect() as conn:
+            result = _discover_live_place(
+                conn, "Test Discovery Place XYZ", "restaurant", 55.68, 12.57, None, None
+            )
+        assert result is not None
+        place_id, found_texts = result
+        assert len(found_texts) >= 1
+
+        with connect() as conn, conn.cursor() as cur:
+            detail = _lookup_place_structured(cur, conn, "Test Discovery Place XYZ")
+        assert detail is not None
+        assert detail["recommendation_confidence"] is not None
+        assert detail["recommendation_label"] in ("recommended", "not recommended")
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT data_status, source_url FROM places WHERE place_id = %s;", (place_id,))
+            data_status, source_url = cur.fetchone()
+        assert data_status == "live_discovered"
+        assert source_url == "https://example.com/test-discovery-place"
+    finally:
+        if place_id:
+            _cleanup_discovered_place(place_id)
+
+
+def test_discover_live_place_persists_nothing_when_no_evidence_is_found(monkeypatch):
+    # Core requirement C: insufficient evidence must not produce a fake
+    # score, and must not silently persist a place with nothing behind it.
+    import agent.tools as tools_module
+    import ingestion.web_enrichment as web_enrichment
+
+    monkeypatch.setattr(web_enrichment, "search_web", lambda q: [])
+    monkeypatch.setattr(tools_module, "_wikipedia_summary", lambda name: None)
+
+    with connect() as conn:
+        result = _discover_live_place(
+            conn, "Nonexistent Test Place ZZZ999", "restaurant", 55.68, 12.57, None, None
+        )
+    assert result is None
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM places WHERE name = 'Nonexistent Test Place ZZZ999';")
+        assert cur.fetchone()[0] == 0
+
+
+def test_search_place_live_points_to_the_curated_name_for_a_real_re_resolved_place(monkeypatch):
+    # End-to-end (mocked Nominatim only — Tier 1 re-resolution itself
+    # needs no Serper/network beyond that) version of the real "Little
+    # Mermaid" case: an English query that Nominatim resolves to the
+    # exact same real-world entity already curated under its Danish name.
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: _FakeResponse([{
+            "name": "Den lille Havfrue", "display_name": "Den lille Havfrue, Copenhagen, Denmark",
+            "lat": "55.6928661", "lon": "12.5992896", "osm_type": "node", "osm_id": 25074274,
+            "category": "tourism", "type": "artwork",
+        }]),
+    )
+    result = search_place_live.run(query="The Little Mermaid")
+    assert "already in our curated database as 'Den lille Havfrue'" in result
+
+
+def test_discover_live_place_degrades_gracefully_on_a_real_serper_failure(monkeypatch):
+    # Core requirement D: a genuine provider failure (timeout, network
+    # error, rate limit) must degrade to "insufficient evidence," not
+    # crash the whole request or fabricate a score.
+    import agent.tools as tools_module
+    import ingestion.web_enrichment as web_enrichment
+
+    def _raise(*a, **k):
+        raise requests.exceptions.Timeout("Serper timed out")
+
+    monkeypatch.setattr(web_enrichment, "search_web", _raise)
+    monkeypatch.setattr(tools_module, "_wikipedia_summary", lambda name: None)
+
+    with connect() as conn:
+        result = _discover_live_place(
+            conn, "Serper Failure Test Place", "restaurant", 55.68, 12.57, None, None
+        )
+    assert result is None
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM places WHERE name = 'Serper Failure Test Place';")
+        assert cur.fetchone()[0] == 0
+
+
+def test_identical_repeated_tool_calls_reuse_the_cached_result(monkeypatch):
+    # Core requirement L: the system must never depend on the LLM
+    # voluntarily choosing not to repeat itself — a real, deterministic
+    # backstop against wasted repeated work within one request.
+    import agent.tools as tools_module
+
+    tools_module.reset_tool_call_cache()
+    call_count = {"n": 0}
+    real_rows = tools_module._search_places_rows
+
+    def _counting_rows(*a, **k):
+        call_count["n"] += 1
+        return real_rows(*a, **k)
+
+    monkeypatch.setattr(tools_module, "_search_places_rows", _counting_rows)
+
+    first = search_places.run(query="cozy quiet cafe")
+    second = search_places.run(query="cozy quiet cafe")
+    assert first == second
+    assert call_count["n"] == 1, "identical repeated call should not re-run the real search"
+
+    # A genuinely different call must NOT be served from the same cache entry.
+    third = search_places.run(query="sushi restaurant")
+    assert call_count["n"] == 2
+
+
+def test_reset_tool_call_cache_clears_previous_results():
+    import agent.tools as tools_module
+
+    tools_module._tool_call_cache[("fake_tool", ())] = "stale result"
+    tools_module.reset_tool_call_cache()
+    assert tools_module._tool_call_cache == {}
+
+
+def test_searching_the_same_new_place_twice_does_not_create_a_duplicate_row(monkeypatch):
+    # Core requirement G: exact OSM identity first, then coordinate
+    # proximity, before ever creating a new place row — searching the
+    # same genuinely-new place twice must reuse the row the first search
+    # created, not insert a second one.
+    import agent.tools as tools_module
+    import ingestion.web_enrichment as web_enrichment
+
+    monkeypatch.setattr(
+        web_enrichment, "search_web",
+        lambda q: [{
+            "title": "Duplicate Protection Test Place - Copenhagen guide",
+            "link": "https://example.com/duplicate-protection-test",
+            "snippet": "A real test venue in Copenhagen with a consistently good real atmosphere and reviews.",
+        }],
+    )
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: _FakeResponse([{
+            "name": "Duplicate Protection Test Place",
+            "display_name": "Duplicate Protection Test Place, Copenhagen, Denmark",
+            "lat": "55.6900", "lon": "12.5700",
+            "osm_type": "node", "osm_id": 999888777,
+            "category": "amenity", "type": "restaurant",
+        }]),
+    )
+
+    place_id = None
+    try:
+        tools_module.reset_tool_call_cache()
+        first = search_place_live.run(query="Duplicate Protection Test Place")
+        assert "found and added" in first
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT place_id FROM places WHERE osm_id = 'node/999888777';"
+            )
+            place_id = cur.fetchone()[0]
+
+        tools_module.reset_tool_call_cache()  # isolate from the new request-level tool cache
+        second = search_place_live.run(query="Duplicate Protection Test Place")
+        assert "already in our curated database" in second
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM places WHERE osm_id = 'node/999888777';")
+            assert cur.fetchone()[0] == 1
+    finally:
+        if place_id:
+            _cleanup_discovered_place(place_id)

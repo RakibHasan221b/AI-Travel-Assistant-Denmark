@@ -47,11 +47,26 @@ export function PlaceCard({ place }: { place: PlaceRecommendation }) {
             — {place.category}, {place.neighborhood}
           </span>
         </h3>
-        {place.recommendation_confidence !== null && (
+        {place.recommendation_confidence !== null ? (
           <RecommendationRing
             confidence={place.recommendation_confidence}
             label={place.recommendation_label}
           />
+        ) : (
+          // Real bug this fixes: rendering nothing here reads as a
+          // silent gap, not an answer — a traveler can't tell "no score
+          // exists" from "the card hasn't loaded yet." This place was
+          // genuinely found only through the live fallback (outside the
+          // curated, scored dataset), so recommendation_confidence is
+          // honestly null, not zero — showing "0%" would falsely imply a
+          // negative ML recommendation the model never made.
+          <div className="flex flex-col items-center shrink-0 w-16 text-center">
+            <span className="text-[10px] tracking-widest uppercase text-ink-faint leading-tight">
+              Recommendation
+              <br />
+              unavailable
+            </span>
+          </div>
         )}
       </div>
 

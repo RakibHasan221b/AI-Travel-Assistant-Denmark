@@ -12,8 +12,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent.crew import deterministic_trip_plan, plan_trip
+from agent.crew import _trip_plan_from_cached_results, deterministic_trip_plan, plan_trip
 from agent.tools import connect, get_embed_model
+from api.ranking import DEFAULT_POOL_SIZE, rank_explore_candidates
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("api")
@@ -123,7 +124,15 @@ def trip_plan(body: TripPlanRequest):
         result = plan_trip(body.request, body.target_date, body.start_location)
     except _groq_unavailable_errors() as e:
         log.warning(f"Groq unavailable ({type(e).__name__}), falling back to deterministic results: {e}")
-        result = deterministic_trip_plan(body.request, body.target_date, body.start_location)
+        # Try reusing whatever the failed crew run already computed
+        # (place_details results with real recommendation_confidence,
+        # etc.) before discarding it for a brand-new whole-sentence
+        # search — see _trip_plan_from_cached_results' own docstring for
+        # the real bug this fixes. Only genuinely falls through to
+        # deterministic_trip_plan() when the cache has nothing usable.
+        result = _trip_plan_from_cached_results(body.request, body.target_date, body.start_location)
+        if result is None:
+            result = deterministic_trip_plan(body.request, body.target_date, body.start_location)
     except Exception as e:
         log.exception("Crew run failed")
         raise HTTPException(500, f"Trip planning failed: {e}") from e
@@ -151,11 +160,24 @@ def explore(
     q: str = Query(..., description="What to search for"),
     category: str = Query(""),
     neighborhood: str = Query(""),
-    limit: int = Query(15, ge=1, le=50),
+    limit: int = Query(5, ge=1, le=20),
 ):
     """Semantic search (pgvector) over Copenhagen places, ported from
-    app/pages/1_Explore.py — same SQL, same "only show what's actually
-    there" honesty for quality_score/vibe_cluster/summary. Uses
+    app/pages/1_Explore.py, plus a deterministic reranking layer
+    (api/ranking.py) applied after retrieval. Real problem that fix
+    addresses: raw "ORDER BY embedding <=> qvec LIMIT n" treats every one
+    of the n nearest vectors as equally relevant — a real query for
+    "little mermaid" correctly put "Den lille Havfrue" first (similarity
+    0.47) but padded the rest of the list with unrelated hotels/
+    restaurants/statues down around 0.20-0.30, just because they were the
+    next-nearest embeddings. Retrieval now pulls a wider candidate pool
+    (DEFAULT_POOL_SIZE) than what's actually shown, rank_explore_
+    candidates() combines that raw similarity with real lexical name
+    matching and category-intent detection, and only genuinely relevant
+    candidates survive — which can mean fewer than `limit` results, or
+    zero, not padding to fill the page. quality_score/vibe_cluster stay
+    exactly as they were — this only changes which candidates are
+    returned and in what order, never what's shown about each one. Uses
     agent.tools.connect()/get_embed_model() rather than its own copies —
     see agent/tools.py's docstring for why (shared process, shared
     fastembed singleton)."""
@@ -166,7 +188,7 @@ def explore(
     query_embedding = next(model.embed([q]))
 
     sql = """
-        SELECT p.place_id, p.name, p.category, p.neighborhood, p.opening_hours,
+        SELECT p.place_id, p.name, p.category, p.subcategory, p.neighborhood, p.opening_hours,
                1 - (p.embedding <=> %(qvec)s) AS similarity,
                m.predicted_value AS quality_score,
                c.label AS vibe_cluster
@@ -176,7 +198,11 @@ def explore(
         LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
         WHERE p.embedding IS NOT NULL
     """
-    params: dict = {"qvec": query_embedding, "limit": limit}
+    # Pool is wider than what's actually returned — the real candidate a
+    # query actually means (e.g. the exact-name match) isn't always in the
+    # raw embedding-only top few, so the reranker needs a generous pool to
+    # promote it from.
+    params: dict = {"qvec": query_embedding, "limit": DEFAULT_POOL_SIZE}
     if category:
         sql += " AND p.category = %(category)s"
         params["category"] = category
@@ -190,8 +216,10 @@ def explore(
         columns = [d.name for d in cur.description]
         rows = [dict(zip(columns, r)) for r in cur.fetchall()]
 
+        ranked = rank_explore_candidates(q, rows, final_limit=limit)
+
         results = []
-        for r in rows:
+        for r in ranked:
             cur.execute(
                 "SELECT summary_text, sources FROM ai_summaries WHERE place_id = %s "
                 "ORDER BY generated_at DESC LIMIT 1;",

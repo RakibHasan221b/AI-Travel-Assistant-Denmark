@@ -8,7 +8,9 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import agent.crew as crew_module
+import agent.tools as tools_module
 from agent.crew import PlaceRecommendation, TripPlanOutput, _normalize, geocode
+from agent.tools import connect
 
 
 class _FakeResponse:
@@ -152,3 +154,83 @@ def test_place_recommendation_keeps_real_values_matching_placeholder_case_insens
         name="Test2", category="cafe", opening_hours="Mo-Fr 08:00-18:00", why_recommended="test"
     )
     assert place2.opening_hours == "Mo-Fr 08:00-18:00"
+
+
+def test_cached_place_details_are_reused_instead_of_a_fresh_whole_sentence_search(monkeypatch):
+    # Real bug found live: Groq's daily token quota was exhausted right at
+    # the final synthesis call, AFTER every tool call (including
+    # place_details, with a real recommendation_confidence) had already
+    # succeeded — deterministic_trip_plan() threw all of that real work
+    # away and ran a brand-new whole-sentence semantic search instead,
+    # which let "Den lille Havfrue" drop out of a compound request's
+    # results entirely. _trip_plan_from_cached_results() must recover the
+    # already-computed place instead of triggering any new search.
+    tools_module.reset_tool_call_cache()
+    tools_module._tool_call_cache[
+        ("place_details", (("place_names", "Den lille Havfrue"),))
+    ] = "irrelevant cached text — only the kwargs are read"
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("must not run a fresh semantic search when cached results exist")
+
+    monkeypatch.setattr(crew_module, "_search_places_rows", _fail_if_called)
+
+    result = crew_module._trip_plan_from_cached_results(
+        "wanna see little mermaid and after go to a nearby restaurant", "2026-01-01", ""
+    )
+
+    assert result is not None
+    assert [p["name"] for p in result["places"]] == ["Den lille Havfrue"]
+    assert result["places"][0]["recommendation_confidence"] is not None
+
+
+def test_split_compound_request_keeps_little_mermaid_primary_and_restaurant_secondary():
+    # The exact real phrase the user hit live: a compound "see X and then Y
+    # nearby" request must split into a named-place primary half and a
+    # category-shaped secondary half, not be treated as one semantic query.
+    split = crew_module._split_compound_request(
+        "wanna see little mermaid and after go to a nearby restaurant"
+    )
+    assert split is not None
+    assert split["primary_query"] == "wanna see little mermaid"
+    assert split["secondary_query"] == "go to a nearby restaurant"
+    assert split["secondary_category"] == "restaurant"
+    assert split["relationship"] == "near"
+
+
+def test_split_compound_request_returns_none_for_a_plain_single_intent_request():
+    # Safe default: a request with no compound structure (or no "near"
+    # relationship) must fall through to the whole-sentence search, not
+    # get force-split on a guess.
+    assert crew_module._split_compound_request("cozy quiet cafe good for working") is None
+
+
+def test_compound_deterministic_places_ranks_secondary_by_real_distance_from_primary():
+    # Requirement: "nearby" must be resolved from REAL coordinates of the
+    # PRIMARY place (never the traveler's own start_location, never
+    # semantic similarity) — verified here against the real database.
+    split = crew_module._split_compound_request(
+        "wanna see little mermaid and after go to a nearby restaurant"
+    )
+    assert split is not None
+
+    with connect() as conn, conn.cursor() as cur:
+        places = crew_module._compound_deterministic_places(cur, conn, split, start_coords=None)
+
+    assert places[0].name == "Den lille Havfrue"
+    secondary = places[1:]
+    assert len(secondary) >= 2, "expected real curated restaurants near the Little Mermaid"
+    assert all(p.near_place == "Den lille Havfrue" for p in secondary)
+
+    distances = [p.near_distance_km for p in secondary]
+    assert distances == sorted(distances), "secondary places must be ranked nearest-first"
+
+    # Cross-check each reported distance against real haversine math from
+    # the primary place's own coordinates.
+    primary_lat, primary_lon = 55.6928661, 12.5992896
+    with connect() as conn, conn.cursor() as cur:
+        for p in secondary:
+            cur.execute("SELECT lat, lon FROM places WHERE name = %s;", (p.name,))
+            lat, lon = cur.fetchone()
+            expected = tools_module.haversine_km(primary_lat, primary_lon, lat, lon)
+            assert abs(p.near_distance_km - round(expected, 2)) < 0.01

@@ -18,6 +18,14 @@ CREATE TABLE places (
     osm_tags        jsonb NOT NULL DEFAULT '{}',
     price_level     smallint,
     embedding       vector(384),            -- sentence-transformers all-MiniLM-L6-v2, filled in Phase 6
+    -- 'live_discovered': inserted at request time from a real Nominatim
+    -- match + real Serper/Wikipedia evidence (agent/tools.py's live
+    -- discovery path), not part of the original curated OSM ingestion.
+    -- created_at/updated_at above already cover "when," so no separate
+    -- discovered_at/last_updated_at columns — this is the one new fact
+    -- those columns don't capture: which pipeline the row came from.
+    data_status     text NOT NULL DEFAULT 'curated' CHECK (data_status IN ('curated', 'live_discovered')),
+    source_url      text,                   -- live_discovered only: the primary evidence URL found for this place
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );

@@ -10,9 +10,12 @@ const STROKE = 5;
 const RADIUS = (SIZE - STROKE) / 2;
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 
+// 80-100 recommended (green) / 60-79 consider (amber) / 0-59 not
+// recommended (red) — the exact recommendation_confidence value from the
+// backend, never recomputed or reinterpreted here.
 function bandColor(confidence: number): string {
-  if (confidence > 65) return "var(--color-good)";
-  if (confidence >= 40) return "var(--color-warning)";
+  if (confidence >= 80) return "var(--color-good)";
+  if (confidence >= 60) return "var(--color-warning)";
   return "var(--color-critical)";
 }
 

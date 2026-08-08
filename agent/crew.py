@@ -20,6 +20,7 @@ prefix, reading GROQ_API_KEY from the environment.
 
 import logging
 import os
+import re
 import sys
 
 import psycopg
@@ -31,11 +32,14 @@ from pydantic import BaseModel, Field, field_validator
 from agent.tools import (
     _WEATHER_ERROR_MESSAGES,
     _lookup_place_structured,
+    _places_near,
     _search_places_rows,
     _weather_structured,
     connect,
+    get_cached_tool_calls,
     haversine_km,
     place_details,
+    reset_tool_call_cache,
     search_place_live,
     search_places,
     search_places_near,
@@ -45,6 +49,7 @@ from agent.tools import (
     travel_time_estimate,
     weather_conditions,
 )
+from api.ranking import _CATEGORY_KEYWORDS, normalize_text
 
 log = logging.getLogger("crew")
 
@@ -355,9 +360,14 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "this place is to be a good recommendation, not an objective quality rating — report "
             "them as returned, don't reinterpret or round them. Don't recommend a place you didn't "
             "get from place_details.\n\n"
-            "EXCEPTION: for a place the Scout found only via search_place_live, leave it out of "
-            "that place_details call (it isn't in the database) — use the live-lookup result as-is, "
-            "leave recommendation_confidence/recommendation_label/vibe_cluster/summary/sources null.\n\n"
+            "For a place the Scout found via search_place_live: check what that tool's own result "
+            "text said. If it said the place is already in our database under a different name, or "
+            "that it was found and added with real evidence, INCLUDE it in the same batched "
+            "place_details call using the name that result gave you — it now has real data. Only if "
+            "search_place_live said no evidence could be found (or the category was unclear) should "
+            "you leave it out of place_details and leave recommendation_confidence/"
+            "recommendation_label/vibe_cluster/summary/sources null for it — never guess a "
+            "confidence for a place with no real evidence behind it.\n\n"
             "why_recommended and overall_note must sound like a real concierge talking to a "
             "traveler, not a system describing itself: never mention how a place was found (a "
             "tool, 'live lookup', 'our database'), and never comment on what data is/isn't "
@@ -506,11 +516,171 @@ def _recompute_travel(result: dict, start_lat: float, start_lon: float, start_la
     return result
 
 
+def _place_recommendation_kwargs(
+    detail: dict, why: str, start_coords: tuple[float, float] | None = None,
+    lat: float | None = None, lon: float | None = None,
+) -> dict:
+    """Builds the common PlaceRecommendation kwargs from a
+    _lookup_place_structured() result — shared by deterministic_trip_plan's
+    whole-sentence path, its compound-request path (_compound_deterministic
+    _places), and the cache-reuse path (_trip_plan_from_cached_results), so
+    the three don't drift out of sync on which fields come from where.
+    distance_km/walk_minutes/bike_minutes are the traveler's OWN
+    start_location distance — never the "near X" distance, which callers
+    set separately via near_place/near_distance_km."""
+    kwargs = {
+        "name": detail["name"],
+        "category": detail["category"],
+        "neighborhood": detail["neighborhood"] or "unknown area",
+        "opening_hours": detail["opening_hours"],
+        "recommendation_confidence": detail["recommendation_confidence"],
+        "recommendation_label": detail["recommendation_label"],
+        "vibe_cluster": detail["vibe_cluster"],
+        "summary": detail["summary"],
+        "sources": detail["sources"],
+        "why_recommended": why,
+    }
+    if start_coords and lat is not None and lon is not None:
+        dist_km = haversine_km(start_coords[0], start_coords[1], lat, lon)
+        kwargs.update(travel_fields(dist_km))
+    return kwargs
+
+
+def _weather_summary_text(weather: dict, target_date: str) -> str:
+    """Formats _weather_structured()'s result into the same one/two-sentence
+    summary shown across all three no-LLM response paths (deterministic
+    whole-sentence, deterministic compound, and cache-reuse) — kept in one
+    place so they can't drift into inconsistent wording."""
+    if weather["ok"]:
+        return (
+            f"{weather['date']}: high {weather['temp_max_c']}°C / low {weather['temp_min_c']}°C, "
+            f"{weather['precip_mm']}mm precipitation, {weather['wind_kph']}km/h wind."
+        )
+    if weather["error_kind"] == "unparsable_date":
+        return f"Could not parse '{target_date}' as a date (expected YYYY-MM-DD)."
+    return _WEATHER_ERROR_MESSAGES[weather["error_kind"]].format(
+        date=weather.get("date", target_date), days_ahead=weather.get("days_ahead")
+    )
+
+
+# Splits "X and after Y" / "X and then Y" / "X then Y" into two halves.
+# Deliberately tiny — covers the real compound phrasing this was built
+# for ("wanna see little mermaid and after go to a nearby restaurant"),
+# not an attempt at general clause parsing.
+_COMPOUND_SPLIT_RE = re.compile(r"\band\s+(?:then\s+|after(?:wards)?\s+)?|\bthen\b", re.IGNORECASE)
+_NEAR_RE = re.compile(r"\bnear(?:by)?\b", re.IGNORECASE)
+
+
+def _split_compound_request(request: str) -> dict | None:
+    """Best-effort split of a two-part request like 'wanna see little
+    mermaid and after go to a nearby restaurant' into a PRIMARY named-place
+    half and a SECONDARY category half, for deterministic_trip_plan()'s
+    Groq-unavailable path. Deliberately tiny and literal: reuses api.
+    ranking's existing _CATEGORY_KEYWORDS (the same map /explore and
+    search_places already rely on) rather than adding any new taxonomy,
+    parser, or LLM call. Requires the word "near"/"nearby" in the
+    category-shaped half — that's the one relationship this handles for
+    now (see agent/tools.py's _places_near for the actual distance logic).
+    Returns None for anything that doesn't clearly split this way; callers
+    fall back to treating the whole request as one semantic query, exactly
+    like before this existed — the safe default for genuinely single-
+    intent requests."""
+    parts = _COMPOUND_SPLIT_RE.split(request, maxsplit=1)
+    if len(parts) != 2:
+        return None
+    first, second = parts[0].strip(" ,."), parts[1].strip(" ,.")
+    if not first or not second:
+        return None
+
+    def category_in(text: str) -> str | None:
+        for tok in normalize_text(text).split():
+            cat = _CATEGORY_KEYWORDS.get(tok)
+            if cat:
+                return cat
+        return None
+
+    cat_second, cat_first = category_in(second), category_in(first)
+    if cat_second and not cat_first:
+        primary_query, secondary_query, secondary_category = first, second, cat_second
+    elif cat_first and not cat_second:
+        primary_query, secondary_query, secondary_category = second, first, cat_first
+    else:
+        # Both halves (or neither) name a category — genuinely ambiguous,
+        # don't guess which one is the "real" place.
+        return None
+
+    if not _NEAR_RE.search(secondary_query):
+        return None
+
+    return {
+        "primary_query": primary_query,
+        "secondary_query": secondary_query,
+        "secondary_category": secondary_category,
+        "relationship": "near",
+    }
+
+
+def _compound_deterministic_places(cur, conn, split: dict, start_coords: tuple[float, float] | None) -> list:
+    """The 'near' half of deterministic_trip_plan()'s compound-request
+    handling. Resolves the primary named place independently, via the
+    same ranked search a plain single-intent request would use (never the
+    whole compound sentence, which is what previously let the secondary
+    category's words dilute/replace the primary place in the results).
+    Ranks secondary candidates by REAL geographic distance FROM THE
+    PRIMARY PLACE'S OWN COORDINATES (agent.tools._places_near — the same
+    haversine logic search_places_near uses), never by semantic similarity
+    and never using the traveler's own start_location as the anchor."""
+    primary_candidates = _search_places_rows(split["primary_query"], limit=1)
+    if not primary_candidates:
+        return []
+    primary = primary_candidates[0]
+    primary_detail = _lookup_place_structured(cur, conn, primary["name"])
+    if primary_detail is None:
+        return []
+
+    places = [
+        PlaceRecommendation(
+            **_place_recommendation_kwargs(
+                primary_detail,
+                why="The main place you asked to see.",
+                start_coords=start_coords,
+                lat=primary.get("lat"),
+                lon=primary.get("lon"),
+            )
+        )
+    ]
+
+    if primary.get("lat") is not None and primary.get("lon") is not None:
+        nearby_rows = _places_near(
+            cur, primary["lat"], primary["lon"],
+            category=split["secondary_category"],
+            exclude_name=primary_detail["name"],
+            limit=3,
+        )
+        for r in nearby_rows:
+            detail = _lookup_place_structured(cur, conn, r["name"])
+            if detail is None:
+                continue
+            kwargs = _place_recommendation_kwargs(
+                detail,
+                why=f"Near {primary_detail['name']}, matching your request for {split['secondary_category']}.",
+                start_coords=start_coords,
+                lat=r.get("lat"),
+                lon=r.get("lon"),
+            )
+            kwargs["near_place"] = primary_detail["name"]
+            kwargs["near_distance_km"] = round(r["distance_km"], 2)
+            places.append(PlaceRecommendation(**kwargs))
+
+    return places
+
+
 def deterministic_trip_plan(request: str, target_date: str, start_location: str = "") -> dict:
     """The safety net api/main.py's /trip-plan calls when Groq is
     confirmed unavailable (a TPM rate limit, a malformed tool call that
     persisted through plan_trip's one retry, no capacity, or a transient
-    outage) — no LLM call at all, zero Groq tokens spent. Groq is the
+    outage) AND _trip_plan_from_cached_results() found nothing reusable —
+    no LLM call at all, zero Groq tokens spent. Groq is the
     reasoning/orchestration layer here, not the ML recommendation engine:
     the real recommendation-confidence model (agent/recommendation_service
     .py, XGBoost + a numpy-only MiniLM signal) and the real place/weather
@@ -527,56 +697,46 @@ def deterministic_trip_plan(request: str, target_date: str, start_location: str 
     plainly that this is a degraded response rather than disguising it as
     a normal AI-narrated plan.
 
-    Deliberately does NOT try to replicate the Scout's request-parsing
-    (named place vs. open-ended part, "near X" handling, search_place_live
-    as a last resort) — that genuinely needs an LLM to do well. Treats the
-    whole free-text request as one semantic query, a reasonable, honest
-    approximation for a degraded-mode response, not a substitute for a
-    real crew run."""
-    candidates = _search_places_rows(request, limit=5)
-    places = []
-
+    Tries _split_compound_request() first (a real, if narrow, fix for a
+    bug found live: a compound request like "wanna see little mermaid and
+    after go to a nearby restaurant" used to be embedded as ONE whole-
+    sentence query, and the restaurant words diluted the landmark clean out
+    of the results). Falls back to the original whole-sentence semantic
+    search — a reasonable, honest approximation for a degraded-mode
+    response, not a substitute for a real crew run — whenever no compound
+    structure is detected or the primary half doesn't resolve to a real
+    place."""
     start_coords = geocode(start_location) if start_location.strip() else None
 
-    if candidates:
+    split = _split_compound_request(request)
+    places = []
+    if split:
         with connect() as conn, conn.cursor() as cur:
-            for c in candidates:
-                detail = _lookup_place_structured(cur, conn, c["name"])
-                if detail is None:
-                    continue
-                place_kwargs = {
-                    "name": detail["name"],
-                    "category": detail["category"],
-                    "neighborhood": detail["neighborhood"] or "unknown area",
-                    "opening_hours": detail["opening_hours"],
-                    "recommendation_confidence": detail["recommendation_confidence"],
-                    "recommendation_label": detail["recommendation_label"],
-                    "vibe_cluster": detail["vibe_cluster"],
-                    "summary": detail["summary"],
-                    "sources": detail["sources"],
-                    "why_recommended": (
-                        "Matched from our database by relevance to your request — the AI "
-                        "trip-planning assistant couldn't run a full personalized analysis "
-                        "just now."
-                    ),
-                }
-                if start_coords and c.get("lat") is not None and c.get("lon") is not None:
-                    dist_km = haversine_km(start_coords[0], start_coords[1], c["lat"], c["lon"])
-                    place_kwargs.update(travel_fields(dist_km))
-                places.append(PlaceRecommendation(**place_kwargs))
+            places = _compound_deterministic_places(cur, conn, split, start_coords)
+
+    if not places:
+        candidates = _search_places_rows(request, limit=5)
+        if candidates:
+            with connect() as conn, conn.cursor() as cur:
+                for c in candidates:
+                    detail = _lookup_place_structured(cur, conn, c["name"])
+                    if detail is None:
+                        continue
+                    kwargs = _place_recommendation_kwargs(
+                        detail,
+                        why=(
+                            "Matched from our database by relevance to your request — the AI "
+                            "trip-planning assistant couldn't run a full personalized analysis "
+                            "just now."
+                        ),
+                        start_coords=start_coords,
+                        lat=c.get("lat"),
+                        lon=c.get("lon"),
+                    )
+                    places.append(PlaceRecommendation(**kwargs))
 
     weather = _weather_structured(target_date)
-    if weather["ok"]:
-        weather_summary = (
-            f"{weather['date']}: high {weather['temp_max_c']}°C / low {weather['temp_min_c']}°C, "
-            f"{weather['precip_mm']}mm precipitation, {weather['wind_kph']}km/h wind."
-        )
-    elif weather["error_kind"] == "unparsable_date":
-        weather_summary = f"Could not parse '{target_date}' as a date (expected YYYY-MM-DD)."
-    else:
-        weather_summary = _WEATHER_ERROR_MESSAGES[weather["error_kind"]].format(
-            date=weather.get("date", target_date), days_ahead=weather.get("days_ahead")
-        )
+    weather_summary = _weather_summary_text(weather, target_date)
 
     if places:
         overall_note = (
@@ -590,6 +750,91 @@ def deterministic_trip_plan(request: str, target_date: str, start_location: str 
             "Our AI trip-planning assistant is temporarily unavailable, and no close database "
             "matches were found for this request either. Please try again shortly."
         )
+
+    return TripPlanOutput(places=places, weather_summary=weather_summary, overall_note=overall_note).model_dump()
+
+
+def _trip_plan_from_cached_results(request: str, target_date: str, start_location: str = "") -> dict | None:
+    """Called by api/main.py's /trip-plan BEFORE falling back to
+    deterministic_trip_plan(), when Groq fails after the crew's tool calls
+    already succeeded. Real scenario found live: every tool call (search,
+    place_details with real recommendation_confidence for all 4 places,
+    weather) completed successfully, and ONLY the final LLM synthesis call
+    hit Groq's daily token quota — deterministic_trip_plan() would have
+    discarded all of that real, already-computed work and run a brand-new
+    whole-sentence search instead, which is what let the primary named
+    place drop out of a compound request's results.
+
+    Reuses that work via agent.tools' per-request _tool_call_cache
+    (reset at the start of every plan_trip() attempt, so whatever's in it
+    here reflects only the CURRENT request — see reset_tool_call_cache()
+    call sites in plan_trip() above): specifically, which place names the
+    crew already successfully ran place_details for. Weather and
+    travel-distance are recomputed via _weather_structured()/haversine_km
+    rather than reading their own cache entries — both are cheap, local,
+    non-LLM, non-Serper operations already backed by their own real
+    caching (weather_daily table; haversine is pure math), so recomputing
+    them here is not a second live provider call, just reusing the same
+    functions deterministic_trip_plan() itself already relies on.
+
+    Returns None (not a degraded TripPlanOutput) when the cache holds
+    nothing useful, so the caller falls through to the normal
+    deterministic path."""
+    place_detail_calls = get_cached_tool_calls("place_details")
+    if not place_detail_calls:
+        return None
+
+    seen_lower: set[str] = set()
+    names: list[str] = []
+    for kwargs in place_detail_calls:
+        for n in str(kwargs.get("place_names", "")).split(","):
+            n = n.strip()
+            if n and n.lower() not in seen_lower:
+                seen_lower.add(n.lower())
+                names.append(n)
+    if not names:
+        return None
+
+    start_coords = geocode(start_location) if start_location.strip() else None
+
+    places = []
+    with connect() as conn, conn.cursor() as cur:
+        for name in names:
+            detail = _lookup_place_structured(cur, conn, name)
+            if detail is None:
+                continue
+            cur.execute(
+                "SELECT lat, lon FROM places WHERE name ILIKE %(name)s "
+                "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
+                {"name": f"%{name}%", "exact": name},
+            )
+            row = cur.fetchone()
+            lat, lon = row if row else (None, None)
+            kwargs = _place_recommendation_kwargs(
+                detail,
+                why=(
+                    "Already found and scored earlier in this request — the AI trip-planning "
+                    "assistant's final write-up step hit a temporary provider limit, so this "
+                    "reuses the real results it had already gathered instead of starting over."
+                ),
+                start_coords=start_coords,
+                lat=lat,
+                lon=lon,
+            )
+            places.append(PlaceRecommendation(**kwargs))
+
+    if not places:
+        return None
+
+    weather = _weather_structured(target_date)
+    weather_summary = _weather_summary_text(weather, target_date)
+
+    overall_note = (
+        "Our AI trip-planning assistant hit a temporary limit with its language-model "
+        "provider right at the final write-up step, after already gathering real results for "
+        "your request — shown here as-is rather than being discarded for a fresh, less "
+        "specific search."
+    )
 
     return TripPlanOutput(places=places, weather_summary=weather_summary, overall_note=overall_note).model_dump()
 
@@ -649,6 +894,13 @@ def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
         "target_date": target_date,
         "start_location": start_location.strip() or "not provided",
     }
+    # Reset before every real crew execution — a fresh, request-scoped
+    # slate for the identical-tool-call cache (agent/tools.py), not a
+    # cross-request cache. Reset again before the retry below too: that's
+    # an independent crew run, and a call that was legitimately made once
+    # in the first (now-abandoned) attempt shouldn't silently serve a
+    # stale cached result to the retry.
+    reset_tool_call_cache()
     try:
         result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
     except litellm.RateLimitError as e:
@@ -667,6 +919,7 @@ def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
         if "tool_use_failed" not in str(e):
             raise
         log.warning(f"Malformed tool-call generation, retrying once: {e}")
+        reset_tool_call_cache()
         result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
 
     _save_cache(request, target_date, start_location, result)
