@@ -8,10 +8,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import requests
 
 from agent.tools import (
+    _MAX_FORECAST_DAYS,
     _coerce_limit,
     _domain_tier,
     _fetch_and_cache_live_weather,
-    _MAX_FORECAST_DAYS,
     _mentions_copenhagen_or_denmark,
     haversine_km,
     place_details,
@@ -57,11 +57,55 @@ def test_live_weather_refuses_dates_beyond_open_meteos_real_forecast_horizon():
     # can't actually forecast yet, instead of saying so honestly. Checked
     # before any network/DB call — conn=None here would crash immediately
     # if that ordering ever regressed, which is the point of the test.
-    from datetime import date, timedelta
+    from datetime import datetime, timedelta
 
-    too_far = date.today() + timedelta(days=_MAX_FORECAST_DAYS + 5)
-    result = _fetch_and_cache_live_weather(conn=None, d=too_far)
-    assert result is None
+    from agent.tools import _WEATHER_TZ
+
+    too_far = datetime.now(_WEATHER_TZ).date() + timedelta(days=_MAX_FORECAST_DAYS + 5)
+    row, error_kind = _fetch_and_cache_live_weather(conn=None, d=too_far)
+    assert row is None
+    assert error_kind == "out_of_range"
+
+
+class _FakeHTTPErrorResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        error = requests.exceptions.HTTPError(f"{self.status_code} error")
+        error.response = self
+        raise error
+
+
+def test_live_weather_distinguishes_a_real_429_from_other_provider_failures(monkeypatch):
+    # Real problem this guards: a genuine Open-Meteo 429 was once reported
+    # to a traveler identically to "beyond the forecast horizon" for a
+    # date only 8 days out — a real, dishonest claim. rate_limited and
+    # provider_unavailable must stay genuinely distinct error_kinds, not
+    # just distinct in theory.
+    import datetime as dt
+
+    from agent.tools import _WEATHER_TZ
+
+    today = dt.datetime.now(_WEATHER_TZ).date()
+
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeHTTPErrorResponse(429))
+    row, error_kind = _fetch_and_cache_live_weather(conn=None, d=today)
+    assert row is None
+    assert error_kind == "rate_limited"
+
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeHTTPErrorResponse(500))
+    row, error_kind = _fetch_and_cache_live_weather(conn=None, d=today)
+    assert row is None
+    assert error_kind == "provider_unavailable"
+
+    def _raise_connection_error(*a, **k):
+        raise requests.exceptions.ConnectionError("no network")
+
+    monkeypatch.setattr(requests, "get", _raise_connection_error)
+    row, error_kind = _fetch_and_cache_live_weather(conn=None, d=today)
+    assert row is None
+    assert error_kind == "provider_unavailable"
 
 
 def test_relevance_gate_requires_an_explicit_copenhagen_or_denmark_mention():
@@ -89,6 +133,57 @@ def test_travel_time_estimate_without_a_start_point_says_so_without_hitting_the_
     set_trip_start(None, None, "")
     result = travel_time_estimate.run(place_names="Den lille Havfrue")
     assert "No starting location was given" in result
+
+
+def test_place_details_degrades_honestly_when_the_recommendation_model_fails(monkeypatch):
+    # Real gap found while testing this case directly: place_details.run()
+    # let a genuine model-load failure (e.g. a missing/corrupted model
+    # file) propagate raw, uncaught — fine when CrewAI's own tool-call
+    # wrapper happens to catch it during a real agent run, but
+    # deterministic_trip_plan() (agent/crew.py, used when Groq itself is
+    # down) calls _lookup_place_structured() directly with no such net,
+    # so this would have surfaced as a raw 500 in exactly the "Groq is
+    # down" moment the fallback exists for. Must degrade to real place
+    # data with an honest, correctly-attributed reason — NOT "no review
+    # text" when the place genuinely has reviews and the model is what
+    # failed; that would be its own dishonest-error-message bug.
+    import agent.recommendation_service as rec_service
+
+    def _raise(*a, **k):
+        raise RuntimeError("model file missing")
+
+    monkeypatch.setattr(rec_service, "predict_recommendation", _raise)
+
+    result = place_details.run(place_names="Restaurant Klubben")
+    assert "Restaurant Klubben" in result
+    assert "Recommendation confidence: not available (the recommendation model is temporarily unavailable)" in result
+    assert "AI summary:" in result  # everything else about the place still comes through
+
+
+def test_place_details_caps_batch_size_regardless_of_how_many_names_are_passed(monkeypatch):
+    # Real problem this guards: prompting the Scout to be selective about
+    # candidate count was tried and found unreliable in real testing (it
+    # still forwarded 13 loosely-related places for one query despite
+    # explicit instructions). This is the deterministic backstop — each
+    # extra place is a real predict_recommendation() call and, for
+    # uncached places, a live web-lookup fetch, so an unbounded batch is
+    # a genuine cost/reliability risk regardless of prompt compliance.
+    # _lookup_place_structured is mocked out so this doesn't spend real
+    # DB round-trips / live web-fallback fetches for 8 places just to
+    # test the truncation count.
+    import agent.tools as tools_module
+
+    seen = []
+
+    def _fake_lookup(cur, conn, place_name):
+        seen.append(place_name)
+
+    monkeypatch.setattr(tools_module, "_lookup_place_structured", _fake_lookup)
+
+    names = ", ".join(f"Nonexistent Test Place {i}" for i in range(tools_module._MAX_PLACE_DETAILS_BATCH + 3))
+    result = place_details.run(place_names=names)
+    assert len(seen) == tools_module._MAX_PLACE_DETAILS_BATCH
+    assert f"first {tools_module._MAX_PLACE_DETAILS_BATCH} places" in result
 
 
 def test_place_details_with_no_names_says_so_without_hitting_the_network():

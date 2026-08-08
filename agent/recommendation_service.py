@@ -15,6 +15,29 @@ once. fastembed's ONNX export of the same all-MiniLM-L6-v2 weights was
 already verified (cosine similarity 1.0000) to produce the same vectors,
 so it's a safe drop-in for this trained classifier's expected input too.
 
+The MiniLM sentiment classifier is a plain LogisticRegression, so its
+inference is just sigmoid(X @ coef_.T + intercept_) — computed here
+directly in numpy from exported coef_/intercept_ (minilm_sentiment_clf_
+weights.npz), not by unpickling the sklearn object. A real, staged
+memory measurement found `import sklearn` alone costs ~94MB RSS — this,
+combined with FastEmbed and a built CrewAI crew, is what pushed real
+per-process memory past Render's 512MB limit and caused the confirmed
+production OOM.
+
+The XGBoost model is loaded via the native xgboost.Booster/DMatrix API,
+not XGBClassifier — XGBClassifier (the sklearn-compatible wrapper)
+*hard-requires* scikit-learn to be installed (xgboost/sklearn.py raises
+ImportError outright if it's absent, confirmed empirically; it is not a
+soft/optional fallback despite xgboost/compat.py's try/except making it
+look that way for other, unrelated attributes). Booster.predict() on a
+model trained with a binary:logistic objective (this one) returns the
+same already-sigmoid-transformed probability XGBClassifier.predict_proba
+would, from the exact same JSON model file — verified numerically
+(diff = 0.0 across random feature vectors) before switching. With both
+of these changes, scikit-learn is never imported anywhere in this
+process, so it was dropped from the `agent` extra entirely (kept only
+under `modeling`, for offline training).
+
 DistilBERT sentiment is NOT computed live here. A real memory measurement
 (psutil, staged process) found loading transformers' DistilBERT pipeline
 in the live process peaks at ~804MB, well over Render's 512MB free-tier
@@ -36,32 +59,35 @@ import json
 import os
 
 import numpy as np
-from xgboost import XGBClassifier
+import xgboost as xgb
 
 _MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "pipeline", "modeling")
 _XGB_PATH = os.path.join(_MODELS_DIR, "recommendation_classifier.json")
-_MINILM_CLF_PATH = os.path.join(_MODELS_DIR, "minilm_sentiment_clf.joblib")
+_MINILM_CLF_WEIGHTS_PATH = os.path.join(_MODELS_DIR, "minilm_sentiment_clf_weights.npz")
 _SCHEMA_PATH = os.path.join(_MODELS_DIR, "recommendation_feature_schema.json")
 
-_xgb_model: XGBClassifier | None = None
-_minilm_clf = None
+_xgb_model: xgb.Booster | None = None
+_minilm_clf_weights: tuple[np.ndarray, np.ndarray] | None = None
 _schema: dict | None = None
 
 
-def _get_xgb_model() -> XGBClassifier:
+def _get_xgb_model() -> xgb.Booster:
     global _xgb_model
     if _xgb_model is None:
-        _xgb_model = XGBClassifier()
+        _xgb_model = xgb.Booster()
         _xgb_model.load_model(_XGB_PATH)
     return _xgb_model
 
 
-def _get_minilm_clf():
-    global _minilm_clf
-    if _minilm_clf is None:
-        import joblib
-        _minilm_clf = joblib.load(_MINILM_CLF_PATH)
-    return _minilm_clf
+def _get_minilm_clf_weights() -> tuple[np.ndarray, np.ndarray]:
+    """(coef_, intercept_) from the trained LogisticRegression, exported
+    once offline (see pipeline/modeling/ export step) — numpy-only, no
+    scikit-learn import needed at inference time."""
+    global _minilm_clf_weights
+    if _minilm_clf_weights is None:
+        weights = np.load(_MINILM_CLF_WEIGHTS_PATH)
+        _minilm_clf_weights = (weights["coef"], weights["intercept"])
+    return _minilm_clf_weights
 
 
 def _get_schema() -> dict:
@@ -75,13 +101,16 @@ def _get_schema() -> dict:
 def _minilm_good_probability(text: str) -> float:
     """Probability in [0, 1] that a MiniLM-embedded review reads as
     'good' — from agent/tools.py's shared fastembed instance, the same
-    embedding space the training script used sentence-transformers for."""
+    embedding space the training script used sentence-transformers for.
+    Manual sigmoid(X @ coef_.T + intercept_), exactly matching the trained
+    LogisticRegression's own predict_proba (verified to diff = 0.0 on real
+    embeddings before this replaced the sklearn-object path)."""
     from agent.tools import get_embed_model
 
-    embedding = next(get_embed_model().embed([text]))
-    proba = _get_minilm_clf().predict_proba(np.array(embedding).reshape(1, -1))[0]
-    classes = list(_get_minilm_clf().classes_)
-    return float(proba[classes.index(1)])
+    embedding = np.array(next(get_embed_model().embed([text]))).reshape(1, -1)
+    coef, intercept = _get_minilm_clf_weights()
+    z = embedding @ coef.T + intercept
+    return float(1 / (1 + np.exp(-z[0][0])))
 
 
 def extract_features(place: dict) -> tuple[np.ndarray, dict]:
@@ -150,7 +179,10 @@ def predict_recommendation(place: dict) -> dict:
     code (place_details, an API route) wraps as needed."""
     vector, signals = extract_features(place)
     model = _get_xgb_model()
-    probability = float(model.predict_proba(vector)[0][1])  # class 1 == "good"
+    # binary:logistic objective -> Booster.predict() already returns the
+    # sigmoid-transformed probability of class 1 ("good"), same value
+    # XGBClassifier.predict_proba()[:, 1] would from this same model file.
+    probability = float(model.predict(xgb.DMatrix(vector))[0])
     return {
         "recommendation_probability": round(probability, 3),
         "label": "recommended" if probability >= 0.5 else "not recommended",

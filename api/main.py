@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent.crew import plan_trip
+from agent.crew import deterministic_trip_plan, plan_trip
 from agent.tools import connect, get_embed_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -82,12 +82,48 @@ class TripPlanResponse(BaseModel):
     overall_note: str = ""
 
 
+def _groq_unavailable_errors() -> tuple[type[Exception], ...]:
+    """Groq/litellm failures that plan_trip() itself can't resolve — a
+    TPM/TPD rate limit (plan_trip deliberately never retries these — see
+    its own docstring), a malformed tool call that persisted through
+    plan_trip's one in-crew retry, no server capacity, or a transient
+    outage/timeout. Groq is the reasoning/orchestration layer, not the ML
+    recommendation engine — losing it shouldn't mean returning a raw 500
+    when the real place data and recommendation-confidence model (which
+    need no Groq call at all) can still answer the request. Anything NOT
+    in this tuple (a genuine bug, a DB outage, etc.) still surfaces as a
+    real 500 below — this is a deliberate, narrow safety net for known
+    provider failure modes, not a blanket catch-all that would hide real
+    application bugs.
+
+    Imports litellm lazily, on first request, not at module load —
+    `import litellm` alone costs ~120MB RSS (measured), and crewai
+    already only imports it lazily itself (confirmed: bare `import
+    crewai` never touches sys.modules for litellm). A module-level import
+    here would silently undo the memory work that got this process
+    comfortably under Render's 512MB limit, paying that cost on every
+    process start whether or not /trip-plan is ever hit."""
+    import litellm
+
+    return (
+        litellm.RateLimitError,
+        litellm.BadRequestError,
+        litellm.APIConnectionError,
+        litellm.ServiceUnavailableError,
+        litellm.InternalServerError,
+        litellm.Timeout,
+    )
+
+
 @app.post("/trip-plan", response_model=TripPlanResponse)
 def trip_plan(body: TripPlanRequest):
     if not body.request.strip():
         raise HTTPException(400, "request must not be empty")
     try:
         result = plan_trip(body.request, body.target_date, body.start_location)
+    except _groq_unavailable_errors() as e:
+        log.warning(f"Groq unavailable ({type(e).__name__}), falling back to deterministic results: {e}")
+        result = deterministic_trip_plan(body.request, body.target_date, body.start_location)
     except Exception as e:
         log.exception("Crew run failed")
         raise HTTPException(500, f"Trip planning failed: {e}") from e
