@@ -54,7 +54,19 @@ modeling = ["scikit-learn", "xgboost", "optuna", "torch", "mlflow"]
 # produces effectively identical vectors for the same all-MiniLM-L6-v2
 # weights (cosine similarity 1.0000, verified before switching) — no torch
 # import at all. See agent/tools.py's module docstring for the full story.
-agent = ["crewai", "litellm", "fastapi", "uvicorn", "pgvector", "fastembed"]
+# xgboost/joblib/scikit-learn: a real, severe gap found via production log
+# inspection, not caught by any local test — agent/recommendation_service.py
+# (place_details' live recommendation-confidence model) imports all three at
+# runtime, but they were only ever declared under the separate `modeling`
+# extra, which Render's build (`pip install -e ".[agent]"`) never installs.
+# The whole recommendation-confidence feature was silently non-functional in
+# production since it shipped: place_details() genuinely ran, but crashed
+# with "No module named 'xgboost'" on every real request, which CrewAI's
+# tool-call wrapper swallowed into an error string the Concierge worked
+# around instead of surfacing — every prior "it works" check that looked
+# real was actually only ever run locally (a venv with every extra
+# installed together), never against this exact production install.
+agent = ["crewai", "litellm", "fastapi", "uvicorn", "pgvector", "fastembed", "xgboost", "joblib", "scikit-learn"]
 dev = ["pytest", "ruff"]
 
 [tool.ruff]

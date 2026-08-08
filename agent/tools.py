@@ -832,6 +832,23 @@ def weather_conditions(target_date: str, category: str = "") -> str:
     except ValueError:
         return f"Could not parse '{target_date}' as a date (expected YYYY-MM-DD)."
 
+    today = datetime.now(_WEATHER_TZ).date()
+    # Checked here, before ever attempting a live call, so a genuine
+    # out-of-range date and a live call that failed for some OTHER real
+    # reason (e.g. Open-Meteo itself rate-limiting Render — a real 429
+    # observed live in production) can never be reported as the same
+    # thing. Found live: without this split, a real rate-limit error got
+    # dishonestly reported to the traveler as "beyond the forecast
+    # horizon" for a date only 8 days out — correctly attributed, and
+    # correctly out of range, are not the same claim.
+    if d > today and (d - today).days + 1 > _MAX_FORECAST_DAYS:
+        days_ahead = (d - today).days
+        return (
+            f"{d} is {days_ahead} days from now — beyond Open-Meteo's real "
+            f"{_MAX_FORECAST_DAYS}-day forecast horizon. Treat conditions as unknown "
+            "rather than guessing; ask again closer to the date for a real forecast."
+        )
+
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT temp_max_c, temp_min_c, precip_mm, wind_kph FROM weather_daily WHERE date = %s;",
@@ -843,18 +860,10 @@ def weather_conditions(target_date: str, category: str = "") -> str:
             weather_row = _fetch_and_cache_live_weather(conn, d)
 
         if weather_row is None:
-            today = datetime.now(_WEATHER_TZ).date()
-            if d > today:
-                days_ahead = (d - today).days
-                return (
-                    f"{d} is {days_ahead} days from now — beyond Open-Meteo's real "
-                    f"{_MAX_FORECAST_DAYS}-day forecast horizon. Treat conditions as unknown "
-                    "rather than guessing; ask again closer to the date for a real forecast."
-                )
             return (
-                f"No weather data available for {d}, and a live lookup didn't return it either "
-                "(too recent for the historical archive, or the request failed) — treat conditions "
-                "as unknown rather than guessing."
+                f"No weather data available for {d} — a live lookup was attempted but didn't "
+                "return it (a network issue, or the source itself being temporarily "
+                "unavailable) — treat conditions as unknown rather than guessing."
             )
 
         sql = (
