@@ -681,12 +681,21 @@ def _search_place_evidence(place_name: str, official_website: str | None) -> lis
     org match. A `site:`-scoped search is what actually finds it."""
     from ingestion.web_enrichment import filter_results, search_web
 
+    # search_web() reads os.environ["SERPER_API_KEY"] directly and raises
+    # a bare KeyError (not requests.exceptions.RequestException) when it's
+    # unset — that KeyError was propagating uncaught through this whole
+    # call chain (live discovery / place_details) and surfacing as an
+    # HTTP 500 on /trip-plan, which the frontend only shows as "Failed to
+    # fetch". Missing key is a real, expected local/deploy state, not an
+    # error — skip straight to the existing keyless Wikipedia fallback.
+    has_serper_key = bool(os.environ.get("SERPER_API_KEY"))
+
     official_domain = None
     if official_website:
         official_domain = official_website.split("//")[-1].split("/")[0].removeprefix("www.")
 
     results = []
-    if official_domain:
+    if official_domain and has_serper_key:
         try:
             results = filter_results(search_web(f"site:{official_domain} {place_name}"))
         except requests.exceptions.RequestException as e:
@@ -698,7 +707,7 @@ def _search_place_evidence(place_name: str, official_website: str | None) -> lis
         # separately here rather than folded into the shared filter.
         results = [r for r in results if official_domain in r["link"]]
 
-    if not results:
+    if not results and has_serper_key:
         try:
             general_results = filter_results(search_web(f"{place_name} Copenhagen"))
         except requests.exceptions.RequestException as e:
@@ -714,6 +723,8 @@ def _search_place_evidence(place_name: str, official_website: str | None) -> lis
         # registry page (the real Absalon case) may never say "Copenhagen"
         # explicitly even when it's exactly the right page.
         results = [r for r in general_results if _mentions_copenhagen_or_denmark(r.get("snippet", ""))]
+    elif not has_serper_key:
+        log.info(f"SERPER_API_KEY not configured — skipping live web search for {place_name!r}")
 
     tier_names = {0: "official_site", 1: "tourism_org", 2: "search_snippet"}
     evidence = [
