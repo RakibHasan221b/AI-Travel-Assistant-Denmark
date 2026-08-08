@@ -68,6 +68,7 @@ RANDOM_STATE = 42
 GOOD_THRESHOLD = 4.0  # real rating (1-5 scale) at/above which a place counts as "good"
 MODEL_OUT_PATH = os.path.join(os.path.dirname(__file__), "recommendation_classifier.json")
 MINILM_CLF_OUT_PATH = os.path.join(os.path.dirname(__file__), "minilm_sentiment_clf.joblib")
+MINILM_CLF_WEIGHTS_OUT_PATH = os.path.join(os.path.dirname(__file__), "minilm_sentiment_clf_weights.npz")
 FEATURE_SCHEMA_OUT_PATH = os.path.join(os.path.dirname(__file__), "recommendation_feature_schema.json")
 TRAINING_ONLY_PATH = os.path.join(os.path.dirname(__file__), "training_only_labels.jsonl")
 
@@ -231,6 +232,21 @@ def main():
     # into the same scalar feature this model was trained on.
     joblib.dump(minilm_clf, MINILM_CLF_OUT_PATH)
     log.info(f"Saved MiniLM sentiment classifier to {MINILM_CLF_OUT_PATH}")
+
+    # agent/recommendation_service.py loads only these two arrays at
+    # runtime, not the joblib file — importing scikit-learn just to
+    # unpickle a LogisticRegression costs ~94MB RSS by itself (measured),
+    # a real contributor to Render's 512MB OOM. sigmoid(X @ coef_.T +
+    # intercept_) is the exact same computation LogisticRegression's own
+    # predict_proba does for a binary classifier (verified diff = 0.0 on
+    # real embeddings) — the .joblib file above still exists so this
+    # script's own eval/plotting code has a normal sklearn object to use.
+    np.savez(
+        MINILM_CLF_WEIGHTS_OUT_PATH,
+        coef=minilm_clf.coef_.astype(np.float64),
+        intercept=minilm_clf.intercept_.astype(np.float64),
+    )
+    log.info(f"Saved MiniLM classifier weights (numpy-only) to {MINILM_CLF_WEIGHTS_OUT_PATH}")
 
     # Save the exact feature order/category columns seen during training —
     # live inference must build features in this exact shape, and category

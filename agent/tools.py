@@ -186,16 +186,16 @@ def _resolve_place(cur, place_name: str) -> tuple | None:
     return cur.fetchone()
 
 
-@tool
-def search_places(query: str, category: str = "", neighborhood: str = "", limit: int | str = 5) -> str:
-    """Semantic search over Copenhagen places (pgvector). Use this to find
-    candidate places matching a vibe or description, e.g. "cozy quiet cafe
-    good for working". Optionally filter by category (restaurant, cafe,
-    hotel, landmark, bar) and/or neighborhood."""
+def _search_places_rows(query: str, category: str = "", neighborhood: str = "", limit: int | str = 5) -> list[dict]:
+    """The real search_places query, factored out so agent/crew.py's
+    deterministic_trip_plan() (used when Groq is confirmed unavailable —
+    see that function's docstring) can get real candidate places without
+    going through the @tool/LLM-calling layer at all. search_places()
+    below is now a thin text-formatting wrapper around this."""
     model = get_embed_model()
     query_embedding = next(model.embed([query]))
     sql = """
-        SELECT name, category, neighborhood, opening_hours,
+        SELECT name, category, neighborhood, opening_hours, lat, lon,
                1 - (embedding <=> %(qvec)s) AS similarity
         FROM places
         WHERE embedding IS NOT NULL
@@ -212,8 +212,16 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         columns = [d.name for d in cur.description]
-        rows = [dict(zip(columns, r)) for r in cur.fetchall()]
+        return [dict(zip(columns, r)) for r in cur.fetchall()]
 
+
+@tool
+def search_places(query: str, category: str = "", neighborhood: str = "", limit: int | str = 5) -> str:
+    """Semantic search over Copenhagen places (pgvector). Use this to find
+    candidate places matching a vibe or description, e.g. "cozy quiet cafe
+    good for working". Optionally filter by category (restaurant, cafe,
+    hotel, landmark, bar) and/or neighborhood."""
+    rows = _search_places_rows(query, category, neighborhood, limit)
     if not rows:
         return "No matching places found."
     return "\n".join(
@@ -558,6 +566,150 @@ def _fetch_place_knowledge(conn, place_id, place_name: str, official_website: st
     return found_texts
 
 
+def _lookup_place_structured(cur, conn, place_name: str) -> dict | None:
+    """The real place_details lookup for ONE place, factored out so
+    agent/crew.py's deterministic_trip_plan() (used when Groq is
+    confirmed unavailable) can get real recommendation data — including a
+    live predict_recommendation() call, which needs no Groq/LLM at all —
+    without going through the @tool/LLM-calling layer. place_details()
+    below is now a thin per-place text-formatting wrapper around this."""
+    resolved = _resolve_place(cur, place_name)
+    if not resolved:
+        return None
+    place_id = resolved[0]
+
+    cur.execute(
+        """
+        SELECT p.place_id, p.name, p.category, p.subcategory, p.neighborhood,
+               p.opening_hours, p.price_level, p.osm_tags,
+               m.predicted_value AS old_quality_score,
+               d.predicted_value AS distilbert_sentiment_score,
+               c.label AS cluster_label
+        FROM places p
+        LEFT JOIN ml_predictions m ON m.place_id = p.place_id AND m.target = 'quality_score'
+        LEFT JOIN ml_predictions d ON d.place_id = p.place_id AND d.target = 'distilbert_sentiment'
+        LEFT JOIN place_clusters pc ON pc.place_id = p.place_id
+        LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
+        WHERE p.place_id = %s
+        LIMIT 1;
+        """,
+        (place_id,),
+    )
+    row = cur.fetchone()
+    columns = [d.name for d in cur.description]
+    place = dict(zip(columns, row))
+
+    cur.execute(
+        "SELECT aspect_category, avg_score, num_mentions FROM aggregated_sentiment "
+        "WHERE place_id = %s ORDER BY aspect_category;",
+        (place["place_id"],),
+    )
+    aspects = cur.fetchall()
+
+    cur.execute(
+        "SELECT summary_text, sources FROM ai_summaries WHERE place_id = %s "
+        "ORDER BY generated_at DESC LIMIT 1;",
+        (place["place_id"],),
+    )
+    summary_row = cur.fetchone()
+
+    cur.execute(
+        "SELECT text_content FROM reviews_raw WHERE place_id = %s ORDER BY review_id;",
+        (place["place_id"],),
+    )
+    review_texts = [r[0] for r in cur.fetchall()]
+
+    # Last-resort live enrichment — only when this curated place
+    # genuinely has zero linked review text, never as a routine
+    # enrichment step for every place. Whatever's found is stored
+    # immediately (see _fetch_place_knowledge), so this branch only
+    # ever runs once per place for the app's whole lifetime — every
+    # later call sees non-empty review_texts above and skips
+    # straight past this.
+    if not review_texts:
+        official_website = (place["osm_tags"] or {}).get("website")
+        review_texts = _fetch_place_knowledge(conn, place["place_id"], place["name"], official_website)
+
+    # Live recommendation score, replacing the old pre-computed
+    # quality_score — computed fresh from this place's CURRENT raw
+    # review text, never a stored number. The old score is kept
+    # only in a server-side log for comparison, never shown to the
+    # traveler, matching the real evidence that it correlates far
+    # more weakly with actual outcomes (r=0.171 vs 0.668). Needs no
+    # Groq/LLM call at all — the deterministic fallback path relies on
+    # exactly this.
+    from agent.recommendation_service import predict_recommendation
+
+    tags = place["osm_tags"] or {}
+    # A genuine ML-model load failure (missing/corrupted model file) must
+    # not crash this whole place lookup — degrade to an honest "no
+    # recommendation confidence available" for THIS place rather than
+    # losing every other real fact (hours, vibe cluster, AI summary) too.
+    # Real, not hypothetical: deterministic_trip_plan() (agent/crew.py)
+    # calls this function directly, with no CrewAI tool-wrapper safety
+    # net around it — an uncaught exception here would surface as a raw
+    # 500 in exactly the "Groq is down" moment this fallback exists for.
+    try:
+        recommendation = predict_recommendation({
+            "name": place["name"],
+            "category": place["category"],
+            "subcategory": place["subcategory"],
+            "opening_hours": place["opening_hours"],
+            "price_level": place["price_level"],
+            "has_phone": bool(tags.get("phone")),
+            "has_website": bool(tags.get("website")),
+            "review_count": len(review_texts),
+            "reviews": review_texts,
+            "distilbert_sentiment_score": place["distilbert_sentiment_score"],
+        })
+        log.info(
+            f"{place['name']!r}: old_quality_score={place['old_quality_score']} "
+            f"new_recommendation={recommendation}"
+        )
+        has_review_text = recommendation["signals"]["has_review_text"]
+        recommendation_confidence = (
+            round(recommendation["recommendation_probability"] * 100) if has_review_text else None
+        )
+        recommendation_label = recommendation["label"] if has_review_text else None
+        confidence_unavailable_reason = None if has_review_text else "no review text for this place"
+    except Exception:
+        log.exception(f"{place['name']!r}: recommendation model failed to load/predict — degrading honestly")
+        has_review_text = bool(review_texts)
+        recommendation_confidence = None
+        recommendation_label = None
+        # Genuinely different claim from "no review text" — this place may
+        # have plenty of reviews; the model itself is what's unavailable.
+        # Conflating the two (as an earlier version of this fix did) is
+        # exactly the kind of dishonest error message this project has
+        # repeatedly had to fix elsewhere (see weather_conditions' own
+        # rate_limited/provider_unavailable split).
+        confidence_unavailable_reason = "the recommendation model is temporarily unavailable"
+
+    source_urls = []
+    summary_text = None
+    if summary_row:
+        summary_text, sources = summary_row
+        source_urls = [s.get("source_url") for s in sources if s.get("source_url")]
+
+    return {
+        "name": place["name"],
+        "category": place["category"],
+        "neighborhood": place["neighborhood"],
+        "opening_hours": place["opening_hours"],
+        "has_review_text": has_review_text,
+        "recommendation_confidence": recommendation_confidence,
+        "recommendation_label": recommendation_label,
+        "confidence_unavailable_reason": confidence_unavailable_reason,
+        "vibe_cluster": place["cluster_label"],
+        "aspects": [(a[0], a[1], a[2]) for a in aspects],
+        "summary": summary_text,
+        "sources": source_urls,
+    }
+
+
+_MAX_PLACE_DETAILS_BATCH = 8
+
+
 @tool
 def place_details(place_names: str) -> str:
     """Looks up everything known about one or more Copenhagen places:
@@ -573,120 +725,56 @@ def place_details(place_names: str) -> str:
     if not names:
         return "No place name given."
 
+    # Hard, deterministic ceiling — not just prompt guidance, which was
+    # tried and found unreliable in real testing (the Scout still passed
+    # 13 loosely-related candidates through despite explicit instructions
+    # to be selective). Each extra place here means a live
+    # predict_recommendation() call and, for uncached places, a live
+    # web-lookup fetch (agent/tools.py's _fetch_place_knowledge) — real
+    # time and, upstream, real tokens once this batch's result goes back
+    # into the LLM's context. This caps the worst case regardless of how
+    # many candidates the Scout decided to forward.
+    truncated = len(names) > _MAX_PLACE_DETAILS_BATCH
+    names = names[:_MAX_PLACE_DETAILS_BATCH]
+
     blocks = []
     with connect() as conn, conn.cursor() as cur:
         for place_name in names:
-            resolved = _resolve_place(cur, place_name)
-            if not resolved:
+            detail = _lookup_place_structured(cur, conn, place_name)
+            if detail is None:
                 blocks.append(f"No place found matching '{place_name}'.")
                 continue
-            place_id = resolved[0]
-
-            cur.execute(
-                """
-                SELECT p.place_id, p.name, p.category, p.subcategory, p.neighborhood,
-                       p.opening_hours, p.price_level, p.osm_tags,
-                       m.predicted_value AS old_quality_score,
-                       d.predicted_value AS distilbert_sentiment_score,
-                       c.label AS cluster_label
-                FROM places p
-                LEFT JOIN ml_predictions m ON m.place_id = p.place_id AND m.target = 'quality_score'
-                LEFT JOIN ml_predictions d ON d.place_id = p.place_id AND d.target = 'distilbert_sentiment'
-                LEFT JOIN place_clusters pc ON pc.place_id = p.place_id
-                LEFT JOIN clusters c ON c.cluster_id = pc.cluster_id
-                WHERE p.place_id = %s
-                LIMIT 1;
-                """,
-                (place_id,),
-            )
-            row = cur.fetchone()
-            columns = [d.name for d in cur.description]
-            place = dict(zip(columns, row))
-
-            cur.execute(
-                "SELECT aspect_category, avg_score, num_mentions FROM aggregated_sentiment "
-                "WHERE place_id = %s ORDER BY aspect_category;",
-                (place["place_id"],),
-            )
-            aspects = cur.fetchall()
-
-            cur.execute(
-                "SELECT summary_text, sources FROM ai_summaries WHERE place_id = %s "
-                "ORDER BY generated_at DESC LIMIT 1;",
-                (place["place_id"],),
-            )
-            summary_row = cur.fetchone()
-
-            cur.execute(
-                "SELECT text_content FROM reviews_raw WHERE place_id = %s ORDER BY review_id;",
-                (place["place_id"],),
-            )
-            review_texts = [r[0] for r in cur.fetchall()]
-
-            # Last-resort live enrichment — only when this curated place
-            # genuinely has zero linked review text, never as a routine
-            # enrichment step for every place. Whatever's found is stored
-            # immediately (see _fetch_place_knowledge), so this branch only
-            # ever runs once per place for the app's whole lifetime — every
-            # later call sees non-empty review_texts above and skips
-            # straight past this.
-            if not review_texts:
-                official_website = (place["osm_tags"] or {}).get("website")
-                review_texts = _fetch_place_knowledge(conn, place["place_id"], place["name"], official_website)
-
-            # Live recommendation score, replacing the old pre-computed
-            # quality_score — computed fresh from this place's CURRENT raw
-            # review text, never a stored number. The old score is kept
-            # only in a server-side log for comparison, never shown to the
-            # traveler, matching the real evidence that it correlates far
-            # more weakly with actual outcomes (r=0.171 vs 0.668).
-            from agent.recommendation_service import predict_recommendation
-
-            tags = place["osm_tags"] or {}
-            recommendation = predict_recommendation({
-                "name": place["name"],
-                "category": place["category"],
-                "subcategory": place["subcategory"],
-                "opening_hours": place["opening_hours"],
-                "price_level": place["price_level"],
-                "has_phone": bool(tags.get("phone")),
-                "has_website": bool(tags.get("website")),
-                "review_count": len(review_texts),
-                "reviews": review_texts,
-                "distilbert_sentiment_score": place["distilbert_sentiment_score"],
-            })
-            log.info(
-                f"{place['name']!r}: old_quality_score={place['old_quality_score']} "
-                f"new_recommendation={recommendation}"
-            )
 
             confidence_line = (
-                f"Recommendation confidence: {recommendation['recommendation_probability']*100:.0f}% "
-                f"({recommendation['label']})"
-                if recommendation["signals"]["has_review_text"]
-                else "Recommendation confidence: not available (no review text for this place)"
+                f"Recommendation confidence: {detail['recommendation_confidence']}% "
+                f"({detail['recommendation_label']})"
+                if detail["recommendation_confidence"] is not None
+                else f"Recommendation confidence: not available ({detail['confidence_unavailable_reason']})"
             )
             lines = [
-                f"{place['name']} ({place['category']}, {place['neighborhood'] or 'unknown area'})",
-                f"Opening hours: {place['opening_hours'] or 'unknown'}",
+                f"{detail['name']} ({detail['category']}, {detail['neighborhood'] or 'unknown area'})",
+                f"Opening hours: {detail['opening_hours'] or 'unknown'}",
                 confidence_line,
-                f"Vibe cluster: {place['cluster_label'] or 'unclustered'}",
+                f"Vibe cluster: {detail['vibe_cluster'] or 'unclustered'}",
             ]
-            if aspects:
+            if detail["aspects"]:
                 lines.append(
                     "Rated aspects: "
-                    + ", ".join(f"{a[0]} {a[1]:.1f}/5 ({a[2]} mention(s))" for a in aspects)
+                    + ", ".join(f"{a[0]} {a[1]:.1f}/5 ({a[2]} mention(s))" for a in detail["aspects"])
                 )
-            if summary_row:
-                summary_text, sources = summary_row
-                lines.append(f"AI summary: {summary_text}")
-                source_urls = [s.get("source_url") for s in sources if s.get("source_url")]
-                if source_urls:
-                    lines.append("Sources: " + ", ".join(source_urls))
+            if detail["summary"]:
+                lines.append(f"AI summary: {detail['summary']}")
+                if detail["sources"]:
+                    lines.append("Sources: " + ", ".join(detail["sources"]))
             else:
                 lines.append("AI summary: not available (no linked review text for this place).")
             blocks.append("\n".join(lines))
 
+    if truncated:
+        blocks.append(
+            f"(Only the first {_MAX_PLACE_DETAILS_BATCH} places were looked up — narrow down "
+            "to the ones that genuinely fit before asking again for the rest.)"
+        )
     return "\n\n".join(blocks)
 
 
@@ -749,18 +837,23 @@ _OPEN_METEO_DAILY_FIELDS = "temperature_2m_max,temperature_2m_min,precipitation_
 _MAX_FORECAST_DAYS = 16
 
 
-def _fetch_and_cache_live_weather(conn, d) -> tuple | None:
+def _fetch_and_cache_live_weather(conn, d) -> tuple[tuple | None, str | None]:
     """On a weather_daily cache miss, try Open-Meteo live for this one
     date — the archive endpoint for a past date (safe to call for any
     historical date, weather doesn't change), the forecast endpoint for
-    today or a near-future date. Returns (temp_max_c, temp_min_c,
-    precip_mm, wind_kph) and upserts it into weather_daily so the next
-    request for the same date hits the cache instead of calling the API
-    again — same "fetch once, store it, never pay for it twice" pattern
-    search_place_live's Serper-backed cousin uses elsewhere in this
-    project. Returns None if the date is genuinely out of Open-Meteo's
-    real range (too far future) or the live call itself fails — the
-    caller is responsible for being honest about which."""
+    today or a near-future date. Returns (row, error_kind): row is
+    (temp_max_c, temp_min_c, precip_mm, wind_kph) on success, upserted
+    into weather_daily so the next request for the same date hits the
+    cache instead of calling the API again — same "fetch once, store it,
+    never pay for it twice" pattern search_place_live's Serper-backed
+    cousin uses elsewhere in this project. On failure, row is None and
+    error_kind is one of "rate_limited" (a real Open-Meteo 429, observed
+    live in production) or "provider_unavailable" (network error, 5xx,
+    timeout, unparsable response) — found live: without this split, a
+    genuine rate-limit hit and "beyond the forecast horizon" were
+    reported identically, which is a real, different, and dishonest
+    claim about a date only days out. The caller checks the date range
+    itself before ever calling this, so that case never reaches here."""
     today = datetime.now(_WEATHER_TZ).date()
     is_past = d < today
 
@@ -774,7 +867,7 @@ def _fetch_and_cache_live_weather(conn, d) -> tuple | None:
     else:
         days_ahead = (d - today).days + 1
         if days_ahead > _MAX_FORECAST_DAYS:
-            return None  # honestly out of range, don't even try
+            return None, "out_of_range"  # defense in depth — callers should already check this first
         url = _OPEN_METEO_FORECAST_URL
         params = {
             "latitude": _WEATHER_LAT, "longitude": _WEATHER_LON,
@@ -786,13 +879,17 @@ def _fetch_and_cache_live_weather(conn, d) -> tuple | None:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         daily = resp.json()["daily"]
+    except requests.exceptions.HTTPError as e:
+        error_kind = "rate_limited" if e.response is not None and e.response.status_code == 429 else "provider_unavailable"
+        log.info(f"Live Open-Meteo call failed for {d} ({error_kind}): {e}")
+        return None, error_kind
     except (requests.exceptions.RequestException, KeyError, ValueError) as e:
-        log.info(f"Live Open-Meteo call failed for {d}: {e}")
-        return None
+        log.info(f"Live Open-Meteo call failed for {d} (provider_unavailable): {e}")
+        return None, "provider_unavailable"
 
     target = d.isoformat()
     if target not in daily["time"]:
-        return None
+        return None, "provider_unavailable"
     i = daily["time"].index(target)
     tmax, tmin, precip, wind, code = (
         daily["temperature_2m_max"][i], daily["temperature_2m_min"][i],
@@ -812,42 +909,37 @@ def _fetch_and_cache_live_weather(conn, d) -> tuple | None:
             (d, tmax, tmin, precip, wind, code),
         )
     conn.commit()
-    return tmax, tmin, precip, wind
+    return (tmax, tmin, precip, wind), None
 
 
-@tool
-def weather_conditions(target_date: str, category: str = "") -> str:
-    """Weather and outdoor-interest conditions for one date (YYYY-MM-DD),
-    optionally scoped to a place category (restaurant, cafe, hotel,
-    landmark). Combines real Open-Meteo weather with the weather-aware
-    forecasting model's Outdoor Interest Index (0-100). Covers historical
-    dates (from 2025-01-01), today, and up to 16 days ahead (Open-Meteo's
-    real forecast horizon) — live, on demand, not just whatever a periodic
-    batch job happened to have already stored. Dates further out than that
-    say so honestly instead of guessing."""
+def _weather_structured(target_date: str, category: str = "") -> dict:
+    """The real weather_conditions lookup, factored out so agent/crew.py's
+    deterministic_trip_plan() (used when Groq is confirmed unavailable)
+    can get real weather with no LLM call at all. weather_conditions()
+    below is now a thin text-formatting wrapper around this.
+
+    Always returns a dict with "ok": bool. On failure, "error_kind" is
+    one of "unparsable_date", "out_of_range", "rate_limited", or
+    "provider_unavailable" — kept genuinely distinct (not collapsed into
+    one generic message) since a real Open-Meteo 429 was once dishonestly
+    reported to a traveler as "beyond the forecast horizon" for a date
+    only 8 days out. On success, "from_cache" says whether this hit
+    weather_daily directly or required a live Open-Meteo call."""
     try:
         # weather_daily.date is a plain SQL date, not timestamptz — the
         # immediate .date() call deliberately discards time/timezone.
         d = datetime.strptime(target_date, "%Y-%m-%d").date()  # noqa: DTZ007
     except ValueError:
-        return f"Could not parse '{target_date}' as a date (expected YYYY-MM-DD)."
+        return {"ok": False, "error_kind": "unparsable_date", "target_date": target_date}
 
     today = datetime.now(_WEATHER_TZ).date()
     # Checked here, before ever attempting a live call, so a genuine
     # out-of-range date and a live call that failed for some OTHER real
     # reason (e.g. Open-Meteo itself rate-limiting Render — a real 429
     # observed live in production) can never be reported as the same
-    # thing. Found live: without this split, a real rate-limit error got
-    # dishonestly reported to the traveler as "beyond the forecast
-    # horizon" for a date only 8 days out — correctly attributed, and
-    # correctly out of range, are not the same claim.
+    # thing.
     if d > today and (d - today).days + 1 > _MAX_FORECAST_DAYS:
-        days_ahead = (d - today).days
-        return (
-            f"{d} is {days_ahead} days from now — beyond Open-Meteo's real "
-            f"{_MAX_FORECAST_DAYS}-day forecast horizon. Treat conditions as unknown "
-            "rather than guessing; ask again closer to the date for a real forecast."
-        )
+        return {"ok": False, "error_kind": "out_of_range", "date": d, "days_ahead": (d - today).days}
 
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -855,16 +947,12 @@ def weather_conditions(target_date: str, category: str = "") -> str:
             (d,),
         )
         weather_row = cur.fetchone()
+        from_cache = weather_row is not None
 
         if weather_row is None:
-            weather_row = _fetch_and_cache_live_weather(conn, d)
-
-        if weather_row is None:
-            return (
-                f"No weather data available for {d} — a live lookup was attempted but didn't "
-                "return it (a network issue, or the source itself being temporarily "
-                "unavailable) — treat conditions as unknown rather than guessing."
-            )
+            weather_row, error_kind = _fetch_and_cache_live_weather(conn, d)
+            if weather_row is None:
+                return {"ok": False, "error_kind": error_kind, "date": d}
 
         sql = (
             "SELECT AVG(vtf.predicted_interest_score) FROM visit_time_forecast vtf "
@@ -878,6 +966,60 @@ def weather_conditions(target_date: str, category: str = "") -> str:
         interest = cur.fetchone()[0]
 
     temp_max, temp_min, precip, wind = weather_row
+    return {
+        "ok": True,
+        "date": d,
+        "from_cache": from_cache,
+        "temp_max_c": temp_max,
+        "temp_min_c": temp_min,
+        "precip_mm": precip,
+        "wind_kph": wind,
+        "outdoor_interest": interest,
+    }
+
+
+_WEATHER_ERROR_MESSAGES = {
+    "out_of_range": (
+        "{date} is {days_ahead} days from now — beyond Open-Meteo's real "
+        f"{_MAX_FORECAST_DAYS}-day forecast horizon. Treat conditions as unknown "
+        "rather than guessing; ask again closer to the date for a real forecast."
+    ),
+    "rate_limited": (
+        "No weather data available for {date} — the weather provider (Open-Meteo) is "
+        "temporarily rate-limiting requests, not that the date is out of range. Treat "
+        "conditions as unknown for now; a retry shortly should succeed."
+    ),
+    "provider_unavailable": (
+        "No weather data available for {date} — a live lookup was attempted but the "
+        "weather provider didn't return it (a network issue or temporary outage, not that "
+        "the date is out of range). Treat conditions as unknown rather than guessing."
+    ),
+}
+
+
+@tool
+def weather_conditions(target_date: str, category: str = "") -> str:
+    """Weather and outdoor-interest conditions for one date (YYYY-MM-DD),
+    optionally scoped to a place category (restaurant, cafe, hotel,
+    landmark). Combines real Open-Meteo weather with the weather-aware
+    forecasting model's Outdoor Interest Index (0-100). Covers historical
+    dates (from 2025-01-01), today, and up to 16 days ahead (Open-Meteo's
+    real forecast horizon) — live, on demand, not just whatever a periodic
+    batch job happened to have already stored. Dates further out than that
+    say so honestly instead of guessing."""
+    result = _weather_structured(target_date, category)
+
+    if not result["ok"]:
+        if result["error_kind"] == "unparsable_date":
+            return f"Could not parse '{target_date}' as a date (expected YYYY-MM-DD)."
+        return _WEATHER_ERROR_MESSAGES[result["error_kind"]].format(
+            date=result["date"], days_ahead=result.get("days_ahead")
+        )
+
+    d, temp_max, temp_min, precip, wind, interest = (
+        result["date"], result["temp_max_c"], result["temp_min_c"],
+        result["precip_mm"], result["wind_kph"], result["outdoor_interest"],
+    )
     lines = [f"{d}: high {temp_max}°C / low {temp_min}°C, {precip}mm precipitation, {wind}km/h wind."]
     if interest is not None:
         scope = f" for {category}" if category else ""

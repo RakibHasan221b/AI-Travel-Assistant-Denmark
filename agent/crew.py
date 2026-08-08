@@ -29,6 +29,11 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
 from agent.tools import (
+    _WEATHER_ERROR_MESSAGES,
+    _lookup_place_structured,
+    _search_places_rows,
+    _weather_structured,
+    connect,
     haversine_km,
     place_details,
     search_place_live,
@@ -289,20 +294,31 @@ def build_crew(llm_kwargs: dict | None = None) -> Crew:
             "- A named place (e.g. 'the Little Mermaid', 'Torvehallerne') → find just that place, "
             "confirm it exists. Do not add unrelated extra candidates for this part.\n"
             "- An open-ended part that says it's near/close to/around ANOTHER specific named place "
-            "(e.g. 'coffee nearby' when a landmark was also named, 'a hotel near Torvehallerne') → "
-            "use search_places_near with that other place as the anchor and a small limit (2-3, "
-            "its default) unless the traveler clearly asked for more options — a few genuinely close "
-            "picks beat a long list. This ranks by real geographic distance, not wording — do not "
-            "use search_places for this, since text similarity alone doesn't mean something is "
-            "actually close by.\n"
-            "- An open-ended part with no reference point (a vibe, category, or 'best of' request "
-            "with nothing to be near, e.g. 'a cozy cafe somewhere in the city') → find 1-3 real "
-            "candidates with search_places (vibe/description match) or top_quality_places "
-            "(best-rated).\n"
+            "THE TRAVELER ACTUALLY NAMED (e.g. 'coffee nearby' when a landmark was also named, 'a "
+            "hotel near Torvehallerne') → use search_places_near with that other place as the anchor "
+            "and a small limit (2-3, its default) unless the traveler clearly asked for more options — "
+            "a few genuinely close picks beat a long list. This ranks by real geographic distance, not "
+            "wording — do not use search_places for this, since text similarity alone doesn't mean "
+            "something is actually close by. NEVER invent an anchor place yourself (e.g. assuming "
+            "'somewhere to see art' means near a specific museum you thought of) — only use "
+            "search_places_near when the traveler's own words named a real reference point.\n"
+            "- An open-ended part with NO reference point the traveler named (a vibe, category, or "
+            "theme, e.g. 'a cozy cafe somewhere in the city', 'somewhere quiet to see art') → use "
+            "ONLY search_places (vibe/description match), not top_quality_places and not "
+            "search_places_near — find 1-3 real candidates. Only use top_quality_places instead of "
+            "search_places when the traveler explicitly asked for the best/top-rated places, not as "
+            "an extra source alongside search_places for the same request.\n"
+            "After search_places returns results, only keep the ones that genuinely fit the theme — "
+            "e.g. for 'quiet art', a museum or gallery fits; a hotel or generic restaurant that merely "
+            "scored a moderate text-similarity number does not, even if the tool returned it. Use your "
+            "own judgment on relevance, not just whatever the tool ranked highest — a shorter list of "
+            "genuine matches beats a padded list of loose ones, and every extra irrelevant place "
+            "candidate costs real tokens downstream.\n"
             "If the request is ONLY a named place with no open-ended part, return just that place. "
-            "If it's ONLY open-ended with no named place, return 3-5 candidates for it. If it's both, "
-            "return both parts — do not silently drop the open-ended part just because a named place "
-            "was also mentioned. List only places your tools actually returned.\n\n"
+            "If it's ONLY open-ended with no named place, return up to 3-5 candidates for it — fewer "
+            "if fewer genuinely fit. If it's both, return both parts — do not silently drop the "
+            "open-ended part just because a named place was also mentioned. List only places your "
+            "tools actually returned.\n\n"
             "If a NAMED place isn't found by search_places, search_places_near, or top_quality_places "
             "at all, try search_place_live as a last resort before giving up on it — it checks whether "
             "the place genuinely exists in Copenhagen even though it's outside our curated, scored "
@@ -488,6 +504,94 @@ def _recompute_travel(result: dict, start_lat: float, start_lon: float, start_la
             place.update(travel_fields(dist_km))
     log.info(f"Cache: reused places/weather for {start_label!r}, recomputed travel time with plain math")
     return result
+
+
+def deterministic_trip_plan(request: str, target_date: str, start_location: str = "") -> dict:
+    """The safety net api/main.py's /trip-plan calls when Groq is
+    confirmed unavailable (a TPM rate limit, a malformed tool call that
+    persisted through plan_trip's one retry, no capacity, or a transient
+    outage) — no LLM call at all, zero Groq tokens spent. Groq is the
+    reasoning/orchestration layer here, not the ML recommendation engine:
+    the real recommendation-confidence model (agent/recommendation_service
+    .py, XGBoost + a numpy-only MiniLM signal) and the real place/weather
+    data underneath were never Groq's job to begin with, so losing Groq
+    doesn't have to mean losing them too.
+
+    Runs the SAME real, deterministic lookups the Scout/Concierge
+    normally orchestrate through an LLM — pgvector semantic search for
+    candidates, then place_details' exact structured lookup (which calls
+    predict_recommendation() directly) for each — just without the LLM
+    doing the request-parsing, tool-calling, or narration. why_recommended
+    /overall_note are honest, plain statements instead of LLM-authored
+    prose, since there's no LLM here to write them, and overall_note says
+    plainly that this is a degraded response rather than disguising it as
+    a normal AI-narrated plan.
+
+    Deliberately does NOT try to replicate the Scout's request-parsing
+    (named place vs. open-ended part, "near X" handling, search_place_live
+    as a last resort) — that genuinely needs an LLM to do well. Treats the
+    whole free-text request as one semantic query, a reasonable, honest
+    approximation for a degraded-mode response, not a substitute for a
+    real crew run."""
+    candidates = _search_places_rows(request, limit=5)
+    places = []
+
+    start_coords = geocode(start_location) if start_location.strip() else None
+
+    if candidates:
+        with connect() as conn, conn.cursor() as cur:
+            for c in candidates:
+                detail = _lookup_place_structured(cur, conn, c["name"])
+                if detail is None:
+                    continue
+                place_kwargs = {
+                    "name": detail["name"],
+                    "category": detail["category"],
+                    "neighborhood": detail["neighborhood"] or "unknown area",
+                    "opening_hours": detail["opening_hours"],
+                    "recommendation_confidence": detail["recommendation_confidence"],
+                    "recommendation_label": detail["recommendation_label"],
+                    "vibe_cluster": detail["vibe_cluster"],
+                    "summary": detail["summary"],
+                    "sources": detail["sources"],
+                    "why_recommended": (
+                        "Matched from our database by relevance to your request — the AI "
+                        "trip-planning assistant couldn't run a full personalized analysis "
+                        "just now."
+                    ),
+                }
+                if start_coords and c.get("lat") is not None and c.get("lon") is not None:
+                    dist_km = haversine_km(start_coords[0], start_coords[1], c["lat"], c["lon"])
+                    place_kwargs.update(travel_fields(dist_km))
+                places.append(PlaceRecommendation(**place_kwargs))
+
+    weather = _weather_structured(target_date)
+    if weather["ok"]:
+        weather_summary = (
+            f"{weather['date']}: high {weather['temp_max_c']}°C / low {weather['temp_min_c']}°C, "
+            f"{weather['precip_mm']}mm precipitation, {weather['wind_kph']}km/h wind."
+        )
+    elif weather["error_kind"] == "unparsable_date":
+        weather_summary = f"Could not parse '{target_date}' as a date (expected YYYY-MM-DD)."
+    else:
+        weather_summary = _WEATHER_ERROR_MESSAGES[weather["error_kind"]].format(
+            date=weather.get("date", target_date), days_ahead=weather.get("days_ahead")
+        )
+
+    if places:
+        overall_note = (
+            "Our AI trip-planning assistant is temporarily unavailable (the language-model "
+            "provider is at capacity), so these are real matching places from our database "
+            "with their genuine recommendation confidence — not a personalized write-up. "
+            "Try again shortly for the full AI-narrated experience."
+        )
+    else:
+        overall_note = (
+            "Our AI trip-planning assistant is temporarily unavailable, and no close database "
+            "matches were found for this request either. Please try again shortly."
+        )
+
+    return TripPlanOutput(places=places, weather_summary=weather_summary, overall_note=overall_note).model_dump()
 
 
 def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
