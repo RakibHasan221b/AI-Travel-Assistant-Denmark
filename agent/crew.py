@@ -12,17 +12,24 @@ Found live: that fixed cost was ~1,400-1,600 tokens per run for a task
 this small — cutting it directly reduces every single run's token bill,
 not just repeated ones.
 
-LLM is Groq (llama-3.3-70b-versatile), not GPT-4o — GPT-4o stays scoped to
-Phase 8's RAG summaries per this project's ML/rules-before-LLM-calls
-principle. crewai.LLM talks to Groq via litellm's "groq/<model>" provider
-prefix, reading GROQ_API_KEY from the environment.
+LLM is OpenAI (gpt-4o-mini by default, configurable via OPENAI_MODEL) — was
+Groq (llama-3.3-70b-versatile) until Groq's free-tier 12,000 TPM ceiling
+proved too unreliable in production (see plan_trip's own history of
+rate-limit fixes). crewai routes "gpt-*" model names to its native OpenAI
+provider (crewai.llms.providers.openai.completion.OpenAICompletion, using
+the openai SDK directly, not litellm), reading OPENAI_API_KEY from the
+environment. GPT-4o itself stays scoped to Phase 8's RAG summaries per
+this project's ML/rules-before-LLM-calls principle — gpt-4o-mini is a
+different, much cheaper model reserved for this crew.
 """
 
 import logging
 import os
 import re
 import sys
+from contextvars import ContextVar
 
+import openai
 import psycopg
 import requests
 from crewai import Agent, Crew, Process, Task
@@ -67,9 +74,10 @@ if sys.platform == "win32":
 # prompt-caching APIs (Anthropic). Its own crewai/llms/cache.py docstring
 # says non-caching providers should have the marker stripped, and even
 # defines strip_cache_breakpoint() to do it — but nothing in the installed
-# package actually calls that function (confirmed by grepping the source),
-# so the marker reaches litellm and then Groq's strict OpenAI-compatible API
-# verbatim, which rejects it as an unrecognized message property. Patching
+# package actually calls that function (confirmed by grepping the source,
+# including crewai's native OpenAI provider — it doesn't strip this marker
+# either), so it reaches OpenAI's strict API verbatim, which rejects it as
+# an unrecognized message property, exactly as it did with Groq's. Patching
 # mark_cache_breakpoint() to a no-op is the minimal fix: it makes the marker
 # behave exactly like the strip step that was supposed to run. Safe to
 # remove once crewai actually wires up the strip step for non-Anthropic
@@ -78,18 +86,48 @@ import crewai.llms.cache as _crewai_cache
 
 _crewai_cache.mark_cache_breakpoint = lambda message: dict(message)
 
-# llama-3.3-70b-versatile's free-tier TPM ceiling (12,000) sits right at the
-# edge of what a full 3-agent run needs (~10,000-13,000 depending on how many
-# candidates get scouted) — a clean run can succeed, but it's a tight margin,
-# not comfortable headroom. Tried swapping to llama-3.1-8b-instant for more
-# TPM room, but its function-calling is unreliable — verified live that it
-# emits malformed tool-call syntax Groq's API rejects outright, so it's worse
-# for this crew despite the extra headroom. Staying on 70b (proven correct
-# tool-calling) and instead bounding max_iter per agent + retrying once on a
-# rate-limit hit (see plan_trip) to keep the tight margin from being a hard
-# failure.
-GROQ_MODEL = "groq/llama-3.3-70b-versatile"
-MAX_AGENT_ITER = 6
+# gpt-4o-mini is not a reasoning model (unlike the even-cheaper gpt-5-nano —
+# tried first, but a real test call showed it can silently spend its whole
+# max_tokens budget on invisible reasoning tokens and return nothing, which
+# is exactly the unpredictable-token-usage failure this migration is meant
+# to eliminate) and has a long, proven track record for reliable function/
+# tool calling, which matters more here than shaving another fraction of a
+# cent off an already-cheap request.
+#
+# Token/cost safeguards (small OpenAI credit balance — keep these
+# conservative, not just "whatever the default happens to be"):
+# - OPENAI_MAX_OUTPUT_TOKENS bounds every single LLM call's output, so one
+#   call can never run away with a huge completion.
+# - MAX_LLM_CALLS_PER_REQUEST bounds total LLM calls across BOTH agents for
+#   ONE trip-plan request (enforced in build_crew() below, not just
+#   crewai's own per-agent max_iter) — hitting it raises
+#   TripPlannerLLMUnavailable, which api/main.py treats exactly like an
+#   OpenAI outage: fall back to the deterministic planner, never retry.
+# - max_retries=0 in build_llm() disables the openai SDK's own automatic
+#   retry-on-429/5xx behavior, so a single flaky call can't silently turn
+#   into several billed attempts.
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "900"))
+MAX_LLM_CALLS_PER_REQUEST = int(os.environ.get("MAX_LLM_CALLS_PER_REQUEST", "6"))
+MAX_AGENT_ITER = 3
+
+
+class TripPlannerLLMUnavailable(Exception):
+    """The single, narrow signal api/main.py catches to fall back to the
+    deterministic planner — covers both a real OpenAI failure (rate limit,
+    quota, timeout, connection, auth/config error) and this module's own
+    MAX_LLM_CALLS_PER_REQUEST budget being hit. Deliberately not a bare
+    isinstance() check against raw openai.* exception types at the API
+    layer: crewai's own OpenAI provider re-wraps some of those (e.g.
+    NotFoundError, APIConnectionError) into plain ValueError/ConnectionError
+    internally, which would be unsafe to catch broadly several call frames
+    away without risking hiding an unrelated real bug. Translating at the
+    lowest point this module controls — the llm.call() wrapper in
+    build_crew() — keeps that translation narrow and correct regardless of
+    which concrete exception type any given OpenAI/crewai version raises."""
+
+
+_llm_call_count: ContextVar[int] = ContextVar("_llm_call_count", default=0)
 
 # Nominatim, same free/no-key service ingestion/osm_live_lookup.py already
 # uses — single call per trip-plan request, well within its 1 req/s usage
@@ -246,16 +284,62 @@ GROUNDING_RULE = (
 
 def build_llm():
     return {
-        "model": GROQ_MODEL,
-        "api_key": os.environ["GROQ_API_KEY"],
+        "model": OPENAI_MODEL,
+        "api_key": os.environ["OPENAI_API_KEY"],
         "temperature": 0.3,
+        "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+        # Disables the openai SDK's own automatic retry-on-429/5xx — see
+        # the safeguards comment above MAX_AGENT_ITER for why.
+        "max_retries": 0,
     }
+
+
+_OPENAI_CALL_FAILURES = (
+    openai.RateLimitError,
+    openai.APIConnectionError,
+    openai.APIStatusError,
+    openai.APITimeoutError,
+    openai.AuthenticationError,
+    openai.NotFoundError,
+    openai.InternalServerError,
+    # crewai's native OpenAI provider re-wraps some of the above into these
+    # plain builtins internally, before they ever reach this wrapper — see
+    # TripPlannerLLMUnavailable's own docstring for why that re-wrapping
+    # means this tuple has to include them too, not just the raw openai.*
+    # types, to reliably reach the deterministic fallback.
+    ConnectionError,
+    ValueError,
+)
+
+
+def _instrument_llm(llm):
+    """Wraps llm.call with the two hard safeguards this module owns: a
+    per-request LLM-call budget, and translation of any OpenAI-layer
+    failure into TripPlannerLLMUnavailable at the lowest point this code
+    controls. Both agents in build_crew() share this one llm instance, so
+    wrapping it once here covers the whole crew, not just one agent."""
+    original_call = llm.call
+
+    def _call(*args, **kwargs):
+        count = _llm_call_count.get() + 1
+        if count > MAX_LLM_CALLS_PER_REQUEST:
+            raise TripPlannerLLMUnavailable(
+                f"Trip Planner hit its {MAX_LLM_CALLS_PER_REQUEST}-call budget for this request"
+            )
+        _llm_call_count.set(count)
+        try:
+            return original_call(*args, **kwargs)
+        except _OPENAI_CALL_FAILURES as e:
+            raise TripPlannerLLMUnavailable(str(e)) from e
+
+    llm.call = _call
+    return llm
 
 
 def build_crew(llm_kwargs: dict | None = None) -> Crew:
     from crewai import LLM
 
-    llm = LLM(**(llm_kwargs or build_llm()))
+    llm = _instrument_llm(LLM(**(llm_kwargs or build_llm())))
 
     place_scout = Agent(
         role="Place Scout",
@@ -840,18 +924,13 @@ def _trip_plan_from_cached_results(request: str, target_date: str, start_locatio
 
 
 def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
-    """Never retries a Groq rate-limit hit (TPM or TPD — Groq raises the
-    identical litellm.RateLimitError for both). A retry here means re-running
-    the ENTIRE 3-agent crew from scratch, not just the one failed call — so
-    on a free tier this tight (12,000 TPM / 100,000 TPD), an automatic retry
-    is gambling a full run's worth of tokens on a coin-flip, and losing that
-    gamble can burn a quarter of the day's entire budget from a single user
-    click. That trade only made sense while a real bug (see agent/tools.py's
-    batching and the anti-loop task instructions below) was pushing every
-    run right up against the ceiling; with that fixed, a clean run should
-    fit comfortably, and a genuine rate-limit hit is now the exception, not
-    the norm — worth failing fast and letting a human decide to click again,
-    not worth spending another full run chasing it automatically.
+    """Never retries an OpenAI failure or a MAX_LLM_CALLS_PER_REQUEST hit —
+    both surface as TripPlannerLLMUnavailable (see build_crew/_instrument_llm).
+    A retry here means re-running the ENTIRE crew from scratch, not just the
+    one failed call, so on a small, fixed API budget an automatic retry is
+    gambling a full run's worth of tokens rather than just failing fast and
+    letting api/main.py's existing fallback answer with real database places
+    immediately — cheaper and faster than a coin-flip second attempt.
 
     start_location is geocoded once here (zero LLM cost — plain HTTP call),
     not turned into its own agent tool call: the Concierge's
@@ -867,8 +946,6 @@ def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
     Returns a plain dict (TripPlanOutput.model_dump()), not the pydantic
     object itself — keeps the FastAPI layer decoupled from this module's
     internal schema class."""
-    import litellm
-
     exact = _get_exact_cache(request, target_date, start_location)
     if exact is not None:
         log.info("Cache: exact match, zero LLM cost")
@@ -895,32 +972,16 @@ def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
         "start_location": start_location.strip() or "not provided",
     }
     # Reset before every real crew execution — a fresh, request-scoped
-    # slate for the identical-tool-call cache (agent/tools.py), not a
-    # cross-request cache. Reset again before the retry below too: that's
-    # an independent crew run, and a call that was legitimately made once
-    # in the first (now-abandoned) attempt shouldn't silently serve a
-    # stale cached result to the retry.
+    # slate for both the identical-tool-call cache (agent/tools.py) and the
+    # MAX_LLM_CALLS_PER_REQUEST counter (_instrument_llm) — neither is a
+    # cross-request cache/budget.
     reset_tool_call_cache()
+    _llm_call_count.set(0)
     try:
         result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
-    except litellm.RateLimitError as e:
-        log.warning(f"Groq rate limit hit, not retrying (a retry re-runs the whole crew): {e}")
+    except TripPlannerLLMUnavailable as e:
+        log.warning(f"OpenAI unavailable, not retrying (a retry re-runs the whole crew): {e}")
         raise
-    except litellm.BadRequestError as e:
-        # Occasional malformed tool-call generation (found live: Groq/Llama
-        # sometimes emits <function=...></function> tags instead of proper
-        # JSON, or gets a tool's argument types wrong, which Groq's strict
-        # parser rejects as "tool_use_failed") — not a rate-limit issue, no
-        # cooldown needed, just retry once immediately. Different failure
-        # mode than the llama-3.1-8b-instant malformed-syntax issue noted
-        # above (that one was consistent enough to rule the model out
-        # entirely; this is an occasional glitch on the otherwise-reliable
-        # 70b model, not guaranteed to be fixed by one retry).
-        if "tool_use_failed" not in str(e):
-            raise
-        log.warning(f"Malformed tool-call generation, retrying once: {e}")
-        reset_tool_call_cache()
-        result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
 
     _save_cache(request, target_date, start_location, result)
 

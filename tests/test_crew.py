@@ -3,7 +3,6 @@
 import sys
 from pathlib import Path
 
-import litellm
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -100,10 +99,6 @@ def test_place_recommendation_coerces_placeholder_filler_text_to_null():
     assert place.summary is None
 
 
-def _rate_limit_error(message="rate limited"):
-    return litellm.RateLimitError(message=message, llm_provider="groq", model="llama-3.3-70b-versatile")
-
-
 class _FakeCrew:
     def __init__(self, kickoff_fn):
         self._kickoff_fn = kickoff_fn
@@ -112,14 +107,49 @@ class _FakeCrew:
         return self._kickoff_fn()
 
 
-def test_plan_trip_never_retries_a_rate_limit_hit(monkeypatch):
-    # A retry here means re-running the ENTIRE 3-agent crew, not just the
-    # failed call — on a tight free-tier budget, an automatic retry gambles
-    # a full run's worth of tokens on a coin-flip, and losing that gamble
-    # can burn a large chunk of the day's quota from one user click.
-    # Confirms build_crew is called exactly once, with no retry, regardless
-    # of whether the hit was a per-minute (TPM) or per-day (TPD) limit —
-    # Groq raises the identical litellm.RateLimitError for both.
+def test_instrument_llm_blocks_calls_past_the_configured_budget(monkeypatch):
+    # The hard safety net item 2/10 in the OpenAI migration required: ONE
+    # trip-plan request can never make more than MAX_LLM_CALLS_PER_REQUEST
+    # real LLM calls, enforced by raising before the (N+1)th call is ever
+    # attempted — not just counted after the fact.
+    monkeypatch.setattr(crew_module, "MAX_LLM_CALLS_PER_REQUEST", 2)
+    crew_module._llm_call_count.set(0)
+
+    class _FakeLLM:
+        def call(self, *a, **k):
+            return "ok"
+
+    llm = crew_module._instrument_llm(_FakeLLM())
+    assert llm.call() == "ok"
+    assert llm.call() == "ok"
+    try:
+        llm.call()
+        assert False, "3rd call should have been blocked at MAX_LLM_CALLS_PER_REQUEST=2"
+    except crew_module.TripPlannerLLMUnavailable:
+        pass
+
+
+def test_instrument_llm_caps_output_tokens_via_build_llm(monkeypatch):
+    # OPENAI_MAX_OUTPUT_TOKENS must actually reach the LLM config passed to
+    # crewai — not just exist as an env var nobody reads.
+    monkeypatch.setattr(crew_module, "OPENAI_MAX_OUTPUT_TOKENS", 42)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-for-this-test-only")
+    cfg = crew_module.build_llm()
+    assert cfg["max_tokens"] == 42
+    assert cfg["max_retries"] == 0
+    assert "groq" not in cfg["model"].lower()
+
+
+def test_plan_trip_never_retries_an_llm_unavailable_hit(monkeypatch):
+    # A retry here means re-running the ENTIRE crew, not just the failed
+    # call — on a small, fixed OpenAI credit budget, an automatic retry
+    # gambles a full run's worth of tokens rather than just failing fast
+    # into api/main.py's deterministic fallback. TripPlannerLLMUnavailable
+    # is what _instrument_llm's llm.call() wrapper (agent/crew.py) actually
+    # raises for both a real OpenAI failure and a MAX_LLM_CALLS_PER_REQUEST
+    # hit — this fake crew simulates that having already happened inside a
+    # real crew run. Confirms build_crew is called exactly once, with no
+    # retry.
     monkeypatch.setattr(crew_module, "_get_exact_cache", lambda *a, **k: None)
     monkeypatch.setattr(crew_module, "_save_cache", lambda *a, **k: None)
 
@@ -127,17 +157,14 @@ def test_plan_trip_never_retries_a_rate_limit_hit(monkeypatch):
 
     def kickoff_fn():
         calls["n"] += 1
-        raise _rate_limit_error(
-            "Rate limit reached ... on tokens per day (TPD): Limit 100000, "
-            "Used 98990, Requested 2882. Please try again in 26m57.408s."
-        )
+        raise crew_module.TripPlannerLLMUnavailable("rate limited")
 
     monkeypatch.setattr(crew_module, "build_crew", lambda: _FakeCrew(kickoff_fn))
 
     try:
         crew_module.plan_trip("test request", "2026-01-01")
-        assert False, "expected RateLimitError to propagate"
-    except litellm.RateLimitError:
+        assert False, "expected TripPlannerLLMUnavailable to propagate"
+    except crew_module.TripPlannerLLMUnavailable:
         pass
     assert calls["n"] == 1
 

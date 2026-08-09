@@ -941,8 +941,8 @@ def place_details(place_names: str) -> str:
     Pass ALL the places you need in ONE call, comma-separated (e.g. "Den
     lille Havfrue, Torvehallerne, Nyhavn") — never call this once per
     place, since each separate call resends the whole conversation so far
-    and is a real, measured contributor to hitting Groq's per-minute token
-    limit. Never state a fact about a place that isn't returned here."""
+    and is a real, measured contributor to the LLM's per-request token
+    budget. Never state a fact about a place that isn't returned here."""
     names = [n.strip() for n in place_names.split(",") if n.strip()]
     if not names:
         return "No place name given."

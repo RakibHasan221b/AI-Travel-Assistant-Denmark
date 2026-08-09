@@ -1,7 +1,10 @@
 # Render blueprint for the Phase 11 FastAPI trip-planning service.
 # Deploy: render.com -> New -> Blueprint -> point at this repo. Render reads
-# this file automatically. DATABASE_URL and GROQ_API_KEY must be set as
+# this file automatically. DATABASE_URL and OPENAI_API_KEY must be set as
 # secrets in Render's dashboard (Environment tab) — never committed here.
+# OPENAI_MODEL / OPENAI_MAX_OUTPUT_TOKENS / MAX_LLM_CALLS_PER_REQUEST are
+# optional (agent/crew.py has safe defaults) — set them here too only if
+# overriding the defaults.
 #
 # Known risk, not yet verified live: the `agent` extra's dependency tree
 # (crewai -> torch/transformers/chromadb/lancedb/onnxruntime) is heavy —
@@ -18,7 +21,7 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false
-      - key: GROQ_API_KEY
+      - key: OPENAI_API_KEY
         sync: false
       # Pinned to match pyproject.toml's requires-python and CI's runtime —
       # without this, Render defaults to a newer Python with no prebuilt

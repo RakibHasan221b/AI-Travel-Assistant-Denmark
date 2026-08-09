@@ -38,8 +38,11 @@ modeling = ["scikit-learn", "xgboost", "optuna", "torch", "mlflow"]
 # environment shared with other projects — a global install of crewai here
 # previously broke fastapi/starlette, mcp, and streamlit compatibility for
 # unrelated projects on the same machine.
-# litellm: crewai's native LLM providers don't include Groq directly; Groq
-# only works via litellm's "groq/<model>" fallback path.
+# litellm: crewai still imports it internally (crewai/llms/cache.py, and
+# as the fallback path for any provider without a native crewai class) even
+# though Phase 11's crew itself now runs on crewai's native OpenAI provider
+# (openai SDK directly, no litellm involved in the actual completion calls)
+# — not worth a larger dependency change just to drop a transitive need.
 # langchain-groq is NOT needed here — crewai 1.x's Agent.tools/llm fields are
 # typed to crewai's own BaseTool/BaseLLM, not LangChain's, so Phase 11 doesn't
 # use LangChain at all (see agent/tools.py's docstring).

@@ -12,7 +12,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent.crew import _trip_plan_from_cached_results, deterministic_trip_plan, plan_trip
+from agent.crew import (
+    TripPlannerLLMUnavailable,
+    _trip_plan_from_cached_results,
+    deterministic_trip_plan,
+    plan_trip,
+)
 from agent.tools import connect, get_embed_model
 from api.ranking import DEFAULT_POOL_SIZE, rank_explore_candidates
 
@@ -83,66 +88,23 @@ class TripPlanResponse(BaseModel):
     overall_note: str = ""
 
 
-def _groq_unavailable_errors() -> tuple[type[Exception], ...]:
-    """Groq/litellm failures that plan_trip() itself can't resolve — a
-    TPM/TPD rate limit (plan_trip deliberately never retries these — see
-    its own docstring), a malformed tool call that persisted through
-    plan_trip's one in-crew retry, no server capacity, or a transient
-    outage/timeout. Groq is the reasoning/orchestration layer, not the ML
-    recommendation engine — losing it shouldn't mean returning a raw 500
-    when the real place data and recommendation-confidence model (which
-    need no Groq call at all) can still answer the request. Anything NOT
-    in this tuple (a genuine bug, a DB outage, etc.) still surfaces as a
-    real 500 below — this is a deliberate, narrow safety net for known
-    provider failure modes, not a blanket catch-all that would hide real
-    application bugs.
-
-    Imports litellm lazily, on first request, not at module load —
-    `import litellm` alone costs ~120MB RSS (measured), and crewai
-    already only imports it lazily itself (confirmed: bare `import
-    crewai` never touches sys.modules for litellm). A module-level import
-    here would silently undo the memory work that got this process
-    comfortably under Render's 512MB limit, paying that cost on every
-    process start whether or not /trip-plan is ever hit."""
-    import litellm
-
-    return (
-        litellm.RateLimitError,
-        litellm.BadRequestError,
-        litellm.APIConnectionError,
-        litellm.ServiceUnavailableError,
-        litellm.InternalServerError,
-        litellm.Timeout,
-    )
-
-
-def _is_groq_unavailable_error(e: Exception) -> bool:
-    """True for a Groq/litellm failure plan_trip() itself can't resolve.
-
-    Matches by module prefix as well as the explicit tuple above —
-    pyproject.toml's `agent` extra pins no crewai/litellm version, so
-    Render re-resolves both to whatever is newest on every deploy. litellm
-    has reshuffled which concrete exception subclass a given provider
-    error maps to across versions before; a version bump that changes the
-    subclass for Groq's rate-limit response would otherwise miss the
-    isinstance() tuple and let a plain litellm-originated failure escape
-    as a raw 500 instead of reaching the fallback below. crewai's own
-    executor uses this identical `__module__.startswith("litellm")` check
-    for the same reason (see crew_agent_executor.py's _invoke_loop_react)."""
-    return isinstance(e, _groq_unavailable_errors()) or type(e).__module__.startswith("litellm")
-
-
 @app.post("/trip-plan", response_model=TripPlanResponse)
 def trip_plan(body: TripPlanRequest):
     if not body.request.strip():
         raise HTTPException(400, "request must not be empty")
     try:
         result = plan_trip(body.request, body.target_date, body.start_location)
-    except Exception as e:
-        if not _is_groq_unavailable_error(e):
-            log.exception("Crew run failed")
-            raise HTTPException(500, f"Trip planning failed: {e}") from e
-        log.warning(f"Groq unavailable ({type(e).__name__}), falling back to deterministic results: {e}")
+    except TripPlannerLLMUnavailable as e:
+        # Covers a real OpenAI failure (rate limit, quota, timeout,
+        # connection, auth/config error) and plan_trip's own
+        # MAX_LLM_CALLS_PER_REQUEST budget being hit — both raise this one
+        # exception (see agent/crew.py's build_crew/_instrument_llm), so
+        # there's no provider-specific exception type to enumerate here.
+        # Anything NOT this exception (a genuine bug, a DB outage, etc.)
+        # still surfaces as a real 500 below — a deliberate, narrow safety
+        # net for known LLM-layer failure modes, not a blanket catch-all
+        # that would hide real application bugs.
+        log.warning(f"OpenAI unavailable, falling back to deterministic results: {e}")
         # Try reusing whatever the failed crew run already computed
         # (place_details results with real recommendation_confidence,
         # etc.) before discarding it for a brand-new whole-sentence
@@ -152,6 +114,9 @@ def trip_plan(body: TripPlanRequest):
         result = _trip_plan_from_cached_results(body.request, body.target_date, body.start_location)
         if result is None:
             result = deterministic_trip_plan(body.request, body.target_date, body.start_location)
+    except Exception as e:
+        log.exception("Crew run failed")
+        raise HTTPException(500, f"Trip planning failed: {e}") from e
     return TripPlanResponse(**result)
 
 
