@@ -116,13 +116,32 @@ def _groq_unavailable_errors() -> tuple[type[Exception], ...]:
     )
 
 
+def _is_groq_unavailable_error(e: Exception) -> bool:
+    """True for a Groq/litellm failure plan_trip() itself can't resolve.
+
+    Matches by module prefix as well as the explicit tuple above —
+    pyproject.toml's `agent` extra pins no crewai/litellm version, so
+    Render re-resolves both to whatever is newest on every deploy. litellm
+    has reshuffled which concrete exception subclass a given provider
+    error maps to across versions before; a version bump that changes the
+    subclass for Groq's rate-limit response would otherwise miss the
+    isinstance() tuple and let a plain litellm-originated failure escape
+    as a raw 500 instead of reaching the fallback below. crewai's own
+    executor uses this identical `__module__.startswith("litellm")` check
+    for the same reason (see crew_agent_executor.py's _invoke_loop_react)."""
+    return isinstance(e, _groq_unavailable_errors()) or type(e).__module__.startswith("litellm")
+
+
 @app.post("/trip-plan", response_model=TripPlanResponse)
 def trip_plan(body: TripPlanRequest):
     if not body.request.strip():
         raise HTTPException(400, "request must not be empty")
     try:
         result = plan_trip(body.request, body.target_date, body.start_location)
-    except _groq_unavailable_errors() as e:
+    except Exception as e:
+        if not _is_groq_unavailable_error(e):
+            log.exception("Crew run failed")
+            raise HTTPException(500, f"Trip planning failed: {e}") from e
         log.warning(f"Groq unavailable ({type(e).__name__}), falling back to deterministic results: {e}")
         # Try reusing whatever the failed crew run already computed
         # (place_details results with real recommendation_confidence,
@@ -133,9 +152,6 @@ def trip_plan(body: TripPlanRequest):
         result = _trip_plan_from_cached_results(body.request, body.target_date, body.start_location)
         if result is None:
             result = deterministic_trip_plan(body.request, body.target_date, body.start_location)
-    except Exception as e:
-        log.exception("Crew run failed")
-        raise HTTPException(500, f"Trip planning failed: {e}") from e
     return TripPlanResponse(**result)
 
 
