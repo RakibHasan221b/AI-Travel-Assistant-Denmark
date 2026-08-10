@@ -69,6 +69,15 @@ def set_trip_start(lat: float | None, lon: float | None, label: str) -> None:
     _trip_start["lat"], _trip_start["lon"], _trip_start["label"] = lat, lon, label
 
 
+def get_trip_start() -> dict:
+    """Read-only accessor for the same module-level state set_trip_start()
+    writes — used by agent/crew.py's backend distance backfill
+    (_ensure_start_distance), which needs the real, already-geocoded start
+    coordinates without re-threading them through plan_trip()'s call
+    chain a second time."""
+    return dict(_trip_start)
+
+
 # Per-request memoization for tool calls — a real, deterministic backstop
 # against wasted repeated work within one plan_trip() run, independent of
 # whether an agent's own reasoning ever decides to stop asking for the
@@ -200,6 +209,41 @@ def _coerce_limit(limit: int | str, default: int = 5) -> int:
         return default
 
 
+def _coerce_max_km(max_km: float | str) -> float | None:
+    """search_places_near's max_km follows the identical str-vs-numeric
+    tool-call quirk _coerce_limit exists for (see its own docstring).
+    0/unset/unparsable all mean "use the normal default radius" — returns
+    None so _places_near falls back to MAX_NEARBY_KM itself, rather than
+    duplicating that constant here."""
+    try:
+        value = float(max_km)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _resolve_place_exact(cur, place_name: str) -> tuple | None:
+    """The exact/substring half of _resolve_place (below), split out so a
+    caller that needs to distinguish a CONFIDENT name match from a
+    semantic-nearest guess can try this alone first. Real bug found live
+    using this split: agent/intent.py's named-place resolution, when it
+    used semantic search directly, resolved the query "Den lille Havfrue"
+    to a different, real, distinctly-named place ("Den Genmodificerede
+    Lille Havfrue" — a separate satirical artwork) instead of the exact
+    match, because the embedding-only candidate pool ranked the decoy's
+    stored description text closer to the query than the real exact
+    match's own embedding. An exact/substring SQL check has no such
+    failure mode for a query that names a real place precisely. Returns
+    (place_id, name, lat, lon) or None — never falls back to semantic
+    search itself, that's _resolve_place's job below."""
+    cur.execute(
+        "SELECT place_id, name, lat, lon FROM places WHERE name ILIKE %(name)s "
+        "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
+        {"name": f"%{place_name}%", "exact": place_name},
+    )
+    return cur.fetchone()
+
+
 def _resolve_place(cur, place_name: str) -> tuple | None:
     """Returns (place_id, name, lat, lon) for the best-matching place, or
     None. Tries an exact/substring name match first (cheap, precise); falls
@@ -211,12 +255,7 @@ def _resolve_place(cur, place_name: str) -> tuple | None:
     "Den lille Havfrue" — zero literal text overlap, so ILIKE found nothing
     even though the place and its full AI summary genuinely exist. Semantic
     search doesn't care what language/wording was used, only meaning."""
-    cur.execute(
-        "SELECT place_id, name, lat, lon FROM places WHERE name ILIKE %(name)s "
-        "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
-        {"name": f"%{place_name}%", "exact": place_name},
-    )
-    row = cur.fetchone()
+    row = _resolve_place_exact(cur, place_name)
     if row:
         return row
 
@@ -290,13 +329,24 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
     )
 
 
-def _places_near(cur, lat: float, lon: float, category: str = "", exclude_name: str | None = None, limit: int = 3) -> list[dict]:
-    """Real places within MAX_NEARBY_KM of (lat, lon), sorted by actual
-    haversine distance — the shared core of search_places_near() below,
-    factored out so agent/crew.py's deterministic_trip_plan() can rank
-    "near X" candidates by real geographic distance FROM A NAMED PLACE
-    (never from the traveler's own start_location, and never by semantic
-    similarity) without going through the @tool/LLM-calling layer."""
+def _places_near(
+    cur, lat: float, lon: float, category: str = "", exclude_name: str | None = None,
+    limit: int = 3, max_km: float | None = None,
+) -> list[dict]:
+    """Real places within max_km (default MAX_NEARBY_KM) of (lat, lon),
+    sorted by actual haversine distance — the shared core of
+    search_places_near() below, factored out so agent/crew.py's
+    deterministic_trip_plan() AND its post-crew near-relationship
+    reconciliation (_reconcile_near_relationships) can both rank "near X"
+    candidates by real geographic distance FROM A NAMED PLACE (never from
+    the traveler's own start_location, and never by semantic similarity)
+    without going through the @tool/LLM-calling layer.
+
+    max_km lets a caller tighten the radius (e.g. a traveler who said
+    "within 1 km" or "walking distance") — always capped at MAX_NEARBY_KM
+    even if a caller asks for more, since that ceiling is itself a real
+    honesty rule (see MAX_NEARBY_KM's own comment), not just a default."""
+    radius = MAX_NEARBY_KM if max_km is None else min(max_km, MAX_NEARBY_KM)
     sql = "SELECT name, category, neighborhood, opening_hours, lat, lon FROM places WHERE lat IS NOT NULL AND lon IS NOT NULL"
     params: dict = {}
     if exclude_name:
@@ -312,32 +362,44 @@ def _places_near(cur, lat: float, lon: float, category: str = "", exclude_name: 
     for r in rows:
         r["distance_km"] = haversine_km(lat, lon, r["lat"], r["lon"])
     rows.sort(key=lambda r: r["distance_km"])
-    return [r for r in rows if r["distance_km"] <= MAX_NEARBY_KM][:limit]
+    return [r for r in rows if r["distance_km"] <= radius][:limit]
 
 
 @tool
 @_cache_tool_calls
-def search_places_near(anchor_place: str, category: str = "", limit: int | str = 3) -> str:
+def search_places_near(anchor_place: str, category: str = "", limit: int | str = 3, max_km: float | str = 0) -> str:
     """Finds real places near ANOTHER named place, ranked by actual
     geographic distance — not text/semantic similarity, which only
     approximates proximity through wording and can return places that
-    aren't really close. Use this whenever the request says something is
-    near/close to/around another specific named place (e.g. "coffee near
-    the Little Mermaid", "a hotel near Torvehallerne") — use search_places
-    instead for a request with no such reference point. Optionally filter
-    by category (restaurant, cafe, hotel, landmark, bar)."""
+    aren't really close. Use this whenever the request describes an
+    open-ended part as near/close to/around/next to/on the way to another
+    specific place — that place doesn't have to be repeated in the same
+    clause, only genuinely named somewhere in the traveler's request (e.g.
+    "see the Little Mermaid and grab coffee afterwards nearby" still means
+    coffee near the Little Mermaid). Use search_places instead when the
+    traveler names no reference point at all, or explicitly wants
+    something far away/elsewhere/a different area.
+    max_km optionally tightens the search radius when the traveler gave an
+    approximate distance (e.g. "within 1 km" -> 1, "walking distance" ->
+    about 1.5) — leave at 0 for the normal default radius. Optionally
+    filter by category (restaurant, cafe, hotel, landmark, bar)."""
     limit = _coerce_limit(limit)
+    radius = _coerce_max_km(max_km)
+    display_radius = MAX_NEARBY_KM if radius is None else radius
     with connect() as conn, conn.cursor() as cur:
         anchor = _resolve_place(cur, anchor_place)
         if not anchor:
             return f"No place found matching '{anchor_place}' to search near."
         anchor_id, anchor_name, anchor_lat, anchor_lon = anchor
-        rows = _places_near(cur, anchor_lat, anchor_lon, category=category, exclude_name=anchor_name, limit=limit)
+        rows = _places_near(
+            cur, anchor_lat, anchor_lon, category=category, exclude_name=anchor_name,
+            limit=limit, max_km=radius,
+        )
 
     if not rows:
         scope = f" in category '{category}'" if category else ""
         return (
-            f"No places found within {MAX_NEARBY_KM:.0f} km of {anchor_name}{scope} — "
+            f"No places found within {display_radius:.1f} km of {anchor_name}{scope} — "
             "nothing genuinely nearby, say so honestly rather than suggesting somewhere far away."
         )
     return "\n".join(
@@ -457,6 +519,78 @@ def _discover_live_place(conn, resolved_name: str, mapped_category: str, lat: fl
     return str(place_id), found_texts
 
 
+def _live_lookup(query: str) -> dict:
+    """The real live-lookup implementation, factored out of the
+    search_place_live @tool below (now a thin text-formatting wrapper
+    around this) so agent/intent.py's deterministic candidate-discovery
+    path (discover_candidates_live, below) can run the exact same real
+    Nominatim + curated-match + category-map + evidence-discovery
+    pipeline directly, without going through the @tool/LLM-calling layer —
+    the same "@tool is a thin wrapper around a plain function" pattern
+    already used for search_places/place_details/weather_conditions in
+    this module.
+
+    Returns one of:
+      {"status": "network_error", "error": ...}
+      {"status": "no_result"}
+      {"status": "curated_match", "name": ..., "place_id": ..., "category": ...}
+      {"status": "category_unclear", "name": ..., "address": ...}
+      {"status": "no_evidence", "name": ..., "address": ...}
+      {"status": "discovered", "name": ..., "place_id": ..., "category": ...,
+       "lat": ..., "lon": ..., "found_texts": [...]}
+    Never raises — every branch above (including network_error, kept
+    genuinely distinct from no_result) is a real, valid outcome for a
+    live lookup, not an error to propagate."""
+    _respect_nominatim_rate_limit()
+    try:
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"q": f"{query}, Copenhagen, Denmark", "format": "jsonv2", "limit": 1},
+            headers=NOMINATIM_HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        log.info(f"Live lookup failed for {query!r}: {e}")
+        return {"status": "network_error", "error": str(e)}
+
+    if not results:
+        return {"status": "no_result"}
+
+    r = results[0]
+    name = r.get("name") or query
+    address = r.get("display_name", "address unknown")
+    lat, lon = float(r["lat"]), float(r["lon"])
+    osm_type, osm_id = r.get("osm_type"), r.get("osm_id")
+
+    with connect() as conn, conn.cursor() as cur:
+        curated = _find_curated_match(cur, osm_type, osm_id, lat, lon)
+        if curated:
+            curated_id, curated_name = curated
+            cur.execute("SELECT category FROM places WHERE place_id = %s;", (curated_id,))
+            row = cur.fetchone()
+            return {
+                "status": "curated_match", "name": curated_name, "place_id": str(curated_id),
+                "category": row[0] if row else None,
+            }
+
+        mapped_category = _map_nominatim_category(r.get("category", ""), r.get("type", ""))
+        if not mapped_category:
+            return {"status": "category_unclear", "name": name, "address": address}
+
+        discovered = _discover_live_place(conn, name, mapped_category, lat, lon, osm_type, osm_id)
+
+    if discovered is None:
+        return {"status": "no_evidence", "name": name, "address": address}
+
+    place_id, found_texts = discovered
+    return {
+        "status": "discovered", "name": name, "place_id": place_id, "category": mapped_category,
+        "lat": lat, "lon": lon, "found_texts": found_texts,
+    }
+
+
 @tool
 @_cache_tool_calls
 def search_place_live(query: str) -> str:
@@ -469,60 +603,112 @@ def search_place_live(query: str) -> str:
     confidence — call place_details for it like any other place. If
     evidence genuinely can't be found, says so honestly; never presents an
     invented or default confidence."""
-    _respect_nominatim_rate_limit()
-    try:
-        resp = requests.get(
-            NOMINATIM_URL,
-            params={"q": f"{query}, Copenhagen, Denmark", "format": "jsonv2", "limit": 1},
-            headers=NOMINATIM_HEADERS,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        results = resp.json()
-    except (requests.exceptions.RequestException, ValueError) as e:
-        return f"Live lookup failed for '{query}': {e}"
+    result = _live_lookup(query)
 
-    if not results:
+    if result["status"] == "network_error":
+        return f"Live lookup failed for '{query}': {result['error']}"
+
+    if result["status"] == "no_result":
         return f"No live result found for '{query}' either — it may not exist in Copenhagen."
 
-    r = results[0]
-    name = r.get("name") or query
-    address = r.get("display_name", "address unknown")
-    lat, lon = float(r["lat"]), float(r["lon"])
-    osm_type, osm_id = r.get("osm_type"), r.get("osm_id")
+    if result["status"] == "curated_match":
+        return (
+            f"'{query}' is already in our curated database as '{result['name']}' — "
+            f"call place_details for '{result['name']}' to get its real recommendation "
+            "confidence, vibe cluster, and AI summary; do not treat this as a live-only result."
+        )
 
-    with connect() as conn, conn.cursor() as cur:
-        curated = _find_curated_match(cur, osm_type, osm_id, lat, lon)
-        if curated:
-            _, curated_name = curated
-            return (
-                f"'{query}' is already in our curated database as '{curated_name}' — "
-                f"call place_details for '{curated_name}' to get its real recommendation "
-                "confidence, vibe cluster, and AI summary; do not treat this as a live-only result."
-            )
+    if result["status"] == "category_unclear":
+        return (
+            f"LIVE LOOKUP RESULT (not in our curated dataset, category unclear — no "
+            f"recommendation confidence, vibe cluster, or AI summary available): "
+            f"{result['name']}, {result['address']}."
+        )
 
-        mapped_category = _map_nominatim_category(r.get("category", ""), r.get("type", ""))
-        if not mapped_category:
-            return (
-                f"LIVE LOOKUP RESULT (not in our curated dataset, category unclear — no "
-                f"recommendation confidence, vibe cluster, or AI summary available): {name}, {address}."
-            )
-
-        discovered = _discover_live_place(conn, name, mapped_category, lat, lon, osm_type, osm_id)
-
-    if discovered is None:
+    if result["status"] == "no_evidence":
         return (
             f"LIVE LOOKUP RESULT (not in our curated dataset, and no real review/evidence "
             f"text could be found for it — no recommendation confidence available; treat as "
-            f"unscored, do not invent a confidence): {name}, {address}."
+            f"unscored, do not invent a confidence): {result['name']}, {result['address']}."
         )
 
-    _, found_texts = discovered
+    # discovered
     return (
-        f"'{query}' was found and added to our database as '{name}' — real evidence was found "
-        f"({len(found_texts)} source(s)) and a real recommendation confidence is now available. "
-        f"Call place_details for '{name}' to get it."
+        f"'{query}' was found and added to our database as '{result['name']}' — real evidence was "
+        f"found ({len(result['found_texts'])} source(s)) and a real recommendation confidence is "
+        f"now available. Call place_details for '{result['name']}' to get it."
     )
+
+
+def discover_candidates_live(query: str, category: str = "", neighborhood: str = "", limit: int = 3) -> list[dict]:
+    """NEW — the candidate-discovery Serper fallback for
+    agent/intent.py's execute_trip_specification(), used ONLY when the
+    internal pgvector/SQL search for an open-ended itinerary part came
+    back with too few genuinely relevant results. Deliberately a
+    SEPARATE code path from _search_place_evidence/_fetch_place_knowledge
+    (which enrich ONE already-identified named place with evidence text)
+    — this instead asks Serper for real place NAME candidates matching a
+    category/vibe query, then requires each candidate to independently
+    resolve through the exact same Nominatim + curated-match +
+    category-map + evidence-discovery pipeline _live_lookup already uses
+    for a single named place, before it's ever treated as a genuine
+    result. A Serper search-result title is never trusted on its own —
+    only a title that resolves to a real, geolocatable Copenhagen place
+    with a mappable category and real evidence becomes a candidate.
+
+    Returns a list of dicts: {"name", "category", "lat", "lon"} — real,
+    already-persisted places (curated matches or newly live-discovered
+    ones), never invented. Empty list (not an exception) when
+    SERPER_API_KEY is unset, the search fails, or nothing resolves —
+    the caller must treat that as a real, honest "found nothing more,"
+    not an error."""
+    if not os.environ.get("SERPER_API_KEY"):
+        log.info("SERPER_API_KEY not configured — skipping candidate discovery")
+        return []
+
+    from ingestion.web_enrichment import filter_results, search_web
+
+    search_terms = " ".join(t for t in (query, neighborhood, "Copenhagen") if t).strip()
+    try:
+        results = filter_results(search_web(search_terms))
+    except requests.exceptions.RequestException as e:
+        log.info(f"Candidate-discovery search failed for {search_terms!r}: {e}")
+        return []
+    results = [r for r in results if _mentions_copenhagen_or_denmark(r.get("snippet", ""))]
+
+    seen_lower: set[str] = set()
+    candidates: list[dict] = []
+    for r in results:
+        # Real search-result titles are usually "Place Name - Site Section"
+        # or "Place Name | Site" — the name guess is real text from a real
+        # result, not invented, but still just a GUESS until _live_lookup
+        # independently resolves it below.
+        name_guess = (r.get("title") or "").split(" - ")[0].split(" | ")[0].strip()
+        if not name_guess or name_guess.lower() in seen_lower:
+            continue
+        seen_lower.add(name_guess.lower())
+
+        lookup = _live_lookup(name_guess)
+        if lookup["status"] not in ("curated_match", "discovered"):
+            continue
+        if category and lookup.get("category") != category:
+            continue
+
+        if lookup["status"] == "curated_match":
+            with connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT lat, lon FROM places WHERE place_id = %s;", (lookup["place_id"],))
+                row = cur.fetchone()
+            if row is None:
+                continue
+            lat, lon = row
+        else:
+            lat, lon = lookup["lat"], lookup["lon"]
+
+        candidates.append({"name": lookup["name"], "category": lookup.get("category"), "lat": lat, "lon": lon})
+        if len(candidates) >= limit:
+            break
+
+    return candidates
 
 
 @tool

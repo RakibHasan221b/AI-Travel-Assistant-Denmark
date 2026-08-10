@@ -107,6 +107,14 @@ class _FakeCrew:
         return self._kickoff_fn()
 
 
+class _FakeCrewOutput:
+    """Minimal stand-in for CrewAI's real CrewOutput — only the `.pydantic`
+    attribute _extract_spec/_extract_narration actually read."""
+
+    def __init__(self, pydantic_obj):
+        self.pydantic = pydantic_obj
+
+
 def test_instrument_llm_blocks_calls_past_the_configured_budget(monkeypatch):
     # The hard safety net item 2/10 in the OpenAI migration required: ONE
     # trip-plan request can never make more than MAX_LLM_CALLS_PER_REQUEST
@@ -147,26 +155,162 @@ def test_plan_trip_never_retries_an_llm_unavailable_hit(monkeypatch):
     # into api/main.py's deterministic fallback. TripPlannerLLMUnavailable
     # is what _instrument_llm's llm.call() wrapper (agent/crew.py) actually
     # raises for both a real OpenAI failure and a MAX_LLM_CALLS_PER_REQUEST
-    # hit — this fake crew simulates that having already happened inside a
-    # real crew run. Confirms build_crew is called exactly once, with no
-    # retry.
+    # hit — this fake crew simulates the intent-extraction step itself
+    # failing. Confirms build_intent_crew is called exactly once, with no
+    # retry, and the Concierge crew is never reached.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-for-this-test-only")
     monkeypatch.setattr(crew_module, "_get_exact_cache", lambda *a, **k: None)
     monkeypatch.setattr(crew_module, "_save_cache", lambda *a, **k: None)
 
-    calls = {"n": 0}
+    calls = {"intent": 0, "concierge": 0}
 
     def kickoff_fn():
-        calls["n"] += 1
+        calls["intent"] += 1
         raise crew_module.TripPlannerLLMUnavailable("rate limited")
 
-    monkeypatch.setattr(crew_module, "build_crew", lambda: _FakeCrew(kickoff_fn))
+    monkeypatch.setattr(crew_module, "build_intent_crew", lambda llm: _FakeCrew(kickoff_fn))
+    monkeypatch.setattr(
+        crew_module, "build_concierge_crew",
+        lambda llm: _FakeCrew(lambda: calls.__setitem__("concierge", calls["concierge"] + 1)),
+    )
 
     try:
         crew_module.plan_trip("test request", "2026-01-01")
         assert False, "expected TripPlannerLLMUnavailable to propagate"
     except crew_module.TripPlannerLLMUnavailable:
         pass
-    assert calls["n"] == 1
+    assert calls["intent"] == 1
+    assert calls["concierge"] == 0
+
+
+def test_narration_guard_catches_the_exact_test_b_bare_near_wording():
+    # Real, live-observed regression: "conveniently located near several
+    # cozy cafes" slipped past the phrase-list guard because the bare word
+    # "near" wasn't in it (deliberately — see the next test). The cafes in
+    # this exact real request were actually 2.87-5.04 km away.
+    results = [
+        {"name": "Den lille Havfrue", "near_place": None},
+        {"name": "Switch Coffee", "near_place": None},
+        {"name": "Roast Coffee", "near_place": None},
+    ]
+    narration = crew_module.ConciergeNarration(
+        weather_summary="sunny",
+        overall_note=(
+            "Visiting the Little Mermaid is a must when in Copenhagen, and it's conveniently "
+            "located near several cozy cafes for a delightful coffee afterward."
+        ),
+        place_narrations=[],
+    )
+
+    fixed = crew_module._enforce_narration_matches_deterministic_relationships(results, narration)
+
+    assert "near several cozy cafes" not in fixed.overall_note.lower()
+
+
+def test_narration_guard_leaves_an_unrelated_geographic_description_untouched():
+    # The exact reason bare "near" isn't simply added to the phrase list:
+    # "near the lakes" is a real, true, unrelated geographic aside (Hotel
+    # Nora's actual location relative to Copenhagen's Lakes, not a claim
+    # about distance to another recommended place) and must survive.
+    results = [{"name": "Hotel Nora", "near_place": None}]
+    narration = crew_module.ConciergeNarration(
+        weather_summary="sunny",
+        overall_note="Hotel Nora offers a prime location near the lakes and easy access to shopping.",
+        place_narrations=[
+            crew_module.PlaceNarration(
+                name="Hotel Nora",
+                why_recommended="A prime location near the lakes with a great breakfast buffet.",
+            ),
+        ],
+    )
+
+    fixed = crew_module._enforce_narration_matches_deterministic_relationships(results, narration)
+
+    assert fixed.overall_note == "Hotel Nora offers a prime location near the lakes and easy access to shopping."
+    assert fixed.place_narrations[0].why_recommended == "A prime location near the lakes with a great breakfast buffet."
+
+
+def test_narration_guard_strips_a_false_proximity_claim_for_a_non_near_place():
+    # Real, live-observed gap: the Concierge's free-text prose sometimes
+    # used casual proximity language ("nearby", "a short walk") for a
+    # place whose real, computed near_place was None. Must be caught and
+    # replaced deterministically, without touching unrelated true content.
+    results = [
+        {"name": "Cafe A", "near_place": None},
+        {"name": "Den lille Havfrue", "near_place": None},
+    ]
+    narration = crew_module.ConciergeNarration(
+        weather_summary="sunny",
+        overall_note="Visit the Mermaid, then unwind at one of the cozy cafes nearby. It will be sunny.",
+        place_narrations=[
+            crew_module.PlaceNarration(name="Cafe A", why_recommended="A short walk from the Mermaid, this cafe is lovely."),
+            crew_module.PlaceNarration(name="Den lille Havfrue", why_recommended="An iconic statue worth seeing."),
+        ],
+    )
+
+    fixed = crew_module._enforce_narration_matches_deterministic_relationships(results, narration)
+
+    assert "nearby" not in fixed.overall_note.lower()
+    assert "It will be sunny." in fixed.overall_note
+    assert "short walk" not in fixed.place_narrations[0].why_recommended.lower()
+    assert fixed.place_narrations[1].why_recommended == "An iconic statue worth seeing."  # untouched, no claim to begin with
+
+
+def test_narration_guard_never_touches_a_true_proximity_claim_for_a_real_near_place():
+    results = [{"name": "Cafe B", "near_place": "Den lille Havfrue"}]
+    narration = crew_module.ConciergeNarration(
+        weather_summary="sunny",
+        overall_note="Cafe B is nearby the statue, a lovely short walk away.",
+        place_narrations=[
+            crew_module.PlaceNarration(name="Cafe B", why_recommended="A short walk from the Mermaid, this cafe is lovely."),
+        ],
+    )
+
+    fixed = crew_module._enforce_narration_matches_deterministic_relationships(results, narration)
+
+    assert fixed.overall_note == "Cafe B is nearby the statue, a lovely short walk away."
+    assert fixed.place_narrations[0].why_recommended == "A short walk from the Mermaid, this cafe is lovely."
+
+
+def test_run_structured_trip_plan_synthesizes_from_real_results_when_only_the_concierge_fails(monkeypatch):
+    # The new failure mode this architecture introduces: intent extraction
+    # succeeds and execute_trip_specification() already produced real,
+    # scored places, but the Concierge's final narration call fails. Must
+    # not lose that real work — _synthesize_without_concierge should
+    # produce an honest response directly from it, zero extra LLM cost.
+    from agent.intent import ItineraryPart, TripSpecification
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-for-this-test-only")
+    spec = TripSpecification(
+        parts=[ItineraryPart(sequence_index=0, query="Test Place", named_place=True, relation="primary")]
+    )
+    monkeypatch.setattr(
+        crew_module, "build_intent_crew",
+        lambda llm: _FakeCrew(lambda: _FakeCrewOutput(spec)),
+    )
+
+    fake_results = [{
+        "name": "Test Place", "category": "cafe", "neighborhood": "Indre By",
+        "opening_hours": None, "recommendation_confidence": 80, "recommendation_label": "recommended",
+        "vibe_cluster": None, "summary": None, "sources": [],
+        "distance_km": 1.2, "walk_minutes": 15, "bike_minutes": 5, "travel_note": None,
+        "near_place": None, "near_distance_km": None,
+        "sequence_index": 0, "relation": "primary", "source": "database", "query": "Test Place",
+    }]
+    monkeypatch.setattr(crew_module, "execute_trip_specification", lambda spec: fake_results)
+
+    def _raise_unavailable():
+        raise crew_module.TripPlannerLLMUnavailable("rate limited on the 2nd call")
+
+    monkeypatch.setattr(crew_module, "build_concierge_crew", lambda llm: _FakeCrew(_raise_unavailable))
+    monkeypatch.setattr(crew_module, "_weather_structured", lambda target_date, category="": {"ok": False, "error_kind": "provider_unavailable", "date": target_date})
+
+    result = crew_module._run_structured_trip_plan("see Test Place", "2026-01-01", "")
+
+    assert [p["name"] for p in result["places"]] == ["Test Place"]
+    assert result["places"][0]["recommendation_confidence"] == 80
+    assert result["places"][0]["distance_km"] == 1.2
+    assert "temporary limit" in result["overall_note"]
 
 
 def test_place_recommendation_keeps_real_values_matching_placeholder_case_insensitively():
@@ -261,3 +405,178 @@ def test_compound_deterministic_places_ranks_secondary_by_real_distance_from_pri
             lat, lon = cur.fetchone()
             expected = tools_module.haversine_km(primary_lat, primary_lon, lat, lon)
             assert abs(p.near_distance_km - round(expected, 2)) < 0.01
+
+
+def test_compound_deterministic_places_gives_the_primary_place_start_distance_but_not_secondary(monkeypatch):
+    # Real bug this guards: Vanløse -> Little Mermaid -> Cafe was showing
+    # the cafe's distance FROM VANLØSE ("6.8 km from your start") instead
+    # of from the Little Mermaid, because a real start_coords was being
+    # threaded into the secondary place's kwargs too. The primary place
+    # SHOULD still get a real distance-from-start (that hop genuinely is
+    # start -> primary) — only the secondary "near X" place must not.
+    split = crew_module._split_compound_request(
+        "wanna see little mermaid and after go to a nearby restaurant"
+    )
+    assert split is not None
+
+    vanlose_coords = (55.6761, 12.5306)  # real, approximate Vanløse coordinates
+    with connect() as conn, conn.cursor() as cur:
+        places = crew_module._compound_deterministic_places(cur, conn, split, start_coords=vanlose_coords)
+
+    primary, secondary = places[0], places[1:]
+    assert primary.name == "Den lille Havfrue"
+    assert primary.distance_km is not None, "the primary place's own distance from the real start must still be set"
+    assert len(secondary) >= 1
+    for p in secondary:
+        assert p.near_place == "Den lille Havfrue"
+        assert p.near_distance_km is not None
+        assert p.distance_km is None, (
+            f"{p.name} must not carry a start-relative distance_km — its relevant "
+            "distance is near_distance_km, from the primary place, not from Vanløse"
+        )
+
+
+def test_reconcile_near_relationships_fixes_a_wrong_reference_distance():
+    # The real fix for the reported production bug: even if the Concierge
+    # (an LLM) wrote a start-relative distance_km for a place that's
+    # actually near another recommended place, this backend step
+    # overwrites it using ONLY the Scout's real, cached search_places_near
+    # call — never trusting anything the LLM itself wrote.
+    tools_module.reset_tool_call_cache()
+    tools_module._tool_call_cache[
+        ("search_places_near", (("anchor_place", "Den lille Havfrue"), ("category", "restaurant")))
+    ] = "irrelevant cached text — only the kwargs are read"
+
+    with connect() as conn, conn.cursor() as cur:
+        rows = tools_module._places_near(
+            cur, 55.6928661, 12.5992896, category="restaurant", exclude_name="Den lille Havfrue", limit=1,
+        )
+    assert rows, "expected at least one real restaurant near the Little Mermaid in the live database"
+    nearest_name, real_distance = rows[0]["name"], round(rows[0]["distance_km"], 2)
+
+    result = {
+        "places": [
+            {
+                "name": nearest_name,
+                # Wrong-reference values an LLM might have written — exactly
+                # the reported bug ("6.8 km from your start" for the cafe).
+                "distance_km": 6.8, "walk_minutes": 85, "bike_minutes": 27,
+                "travel_note": "consider transit",
+                "near_place": None, "near_distance_km": None,
+            }
+        ]
+    }
+    fixed = crew_module._reconcile_near_relationships(result)
+    place = fixed["places"][0]
+    assert place["near_place"] == "Den lille Havfrue"
+    assert place["near_distance_km"] == real_distance
+    assert place["distance_km"] is None
+    assert place["walk_minutes"] is None
+    assert place["bike_minutes"] is None
+    assert place["travel_note"] is None
+    tools_module.reset_tool_call_cache()
+
+
+def test_reconcile_near_relationships_matches_a_shortened_llm_written_name():
+    # Real gap found live: the Concierge's final answer wrote the real
+    # place's name shortened ("Terminalen kaffebar" for the database's
+    # real "Terminalen kaffebar - Seaside Toldboden") — an exact-string
+    # lookup would silently miss it, leaving a stale distance_km
+    # uncorrected. Must still match via substring.
+    tools_module.reset_tool_call_cache()
+    tools_module._tool_call_cache[
+        ("search_places_near", (("anchor_place", "Den lille Havfrue"), ("category", "cafe")))
+    ] = "irrelevant cached text — only the kwargs are read"
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT name FROM places WHERE name ILIKE %s;", ("%terminalen%",))
+        real_name = cur.fetchone()[0]
+    assert real_name == "Terminalen kaffebar - Seaside Toldboden"
+    shortened_name = "Terminalen kaffebar"
+
+    result = {"places": [{"name": shortened_name, "distance_km": 6.8, "walk_minutes": 82, "bike_minutes": 27,
+                           "travel_note": "consider transit", "near_place": None, "near_distance_km": None}]}
+    fixed = crew_module._reconcile_near_relationships(result)
+    place = fixed["places"][0]
+    assert place["near_place"] == "Den lille Havfrue"
+    assert place["near_distance_km"] is not None
+    assert place["distance_km"] is None, "the shortened name must still match and clear the stale start-distance"
+    tools_module.reset_tool_call_cache()
+
+
+def test_reconcile_near_relationships_is_a_noop_for_a_plain_single_destination_request():
+    # Existing single-destination behavior must stay exactly as-is: if the
+    # Scout never called search_places_near at all this request, nothing
+    # should be touched or overwritten.
+    tools_module.reset_tool_call_cache()
+    result = {
+        "places": [
+            {"name": "Torvehallerne", "distance_km": 3.1, "walk_minutes": 38, "bike_minutes": 13,
+             "travel_note": None, "near_place": None, "near_distance_km": None}
+        ]
+    }
+    unchanged = crew_module._reconcile_near_relationships(dict(result))
+    assert unchanged == result
+
+
+def test_recompute_travel_never_overwrites_a_place_that_already_has_a_near_place():
+    # A cache-reuse request with a DIFFERENT start location must not
+    # clobber a secondary place's real near_distance_km with a new
+    # start-relative distance_km — its relevant reference never changes
+    # just because the traveler's own starting point did.
+    result = {
+        "places": [
+            {"name": "Den lille Havfrue", "distance_km": None, "near_place": None, "near_distance_km": None},
+            {"name": "Nonna regina", "distance_km": None, "walk_minutes": None, "bike_minutes": None,
+             "travel_note": None, "near_place": "Den lille Havfrue", "near_distance_km": 0.30},
+        ]
+    }
+    updated = crew_module._recompute_travel(result, 55.6761, 12.5306, "Vanløse")
+    primary, secondary = updated["places"]
+    assert primary["distance_km"] is not None, "the primary place should still get a real distance from the new start"
+    assert secondary["distance_km"] is None, "a place with near_place set must not gain a start-relative distance"
+    assert secondary["near_place"] == "Den lille Havfrue"
+    assert secondary["near_distance_km"] == 0.30
+
+
+def test_ensure_start_distance_backfills_a_place_the_concierge_forgot(monkeypatch):
+    # Real gap found live: the Concierge's own batched travel_time_estimate
+    # call sometimes only named the secondary places, leaving the PRIMARY
+    # place's distance_km null even though a real starting point was
+    # given. This must be backfilled deterministically, not left missing.
+    tools_module.set_trip_start(55.6761, 12.5306, "Vanlose")
+    try:
+        result = {
+            "places": [
+                {"name": "Den lille Havfrue", "distance_km": None, "walk_minutes": None,
+                 "bike_minutes": None, "travel_note": None, "near_place": None, "near_distance_km": None},
+                {"name": "Nonna regina", "distance_km": None, "walk_minutes": None, "bike_minutes": None,
+                 "travel_note": None, "near_place": "Den lille Havfrue", "near_distance_km": 0.30},
+            ]
+        }
+        updated = crew_module._ensure_start_distance(result)
+    finally:
+        tools_module.set_trip_start(None, None, None)
+
+    primary, secondary = updated["places"]
+    assert primary["distance_km"] is not None, "a missing primary distance must be backfilled from the real start"
+    assert secondary["distance_km"] is None, "a place with near_place set must never get a backfilled start distance"
+    assert secondary["near_distance_km"] == 0.30, "an already-set near_distance_km must be left untouched"
+
+
+def test_ensure_start_distance_is_a_noop_without_a_real_starting_point():
+    tools_module.set_trip_start(None, None, None)
+    result = {"places": [{"name": "Den lille Havfrue", "distance_km": None, "near_place": None, "near_distance_km": None}]}
+    unchanged = crew_module._ensure_start_distance(dict(result))
+    assert unchanged == result
+
+
+def test_ensure_start_distance_never_overwrites_an_already_set_distance():
+    tools_module.set_trip_start(55.6761, 12.5306, "Vanlose")
+    try:
+        result = {"places": [{"name": "Den lille Havfrue", "distance_km": 1.23, "walk_minutes": 15,
+                               "bike_minutes": 5, "travel_note": None, "near_place": None, "near_distance_km": None}]}
+        updated = crew_module._ensure_start_distance(dict(result))
+    finally:
+        tools_module.set_trip_start(None, None, None)
+    assert updated["places"][0]["distance_km"] == 1.23, "an already-set real distance must never be recomputed/overwritten"

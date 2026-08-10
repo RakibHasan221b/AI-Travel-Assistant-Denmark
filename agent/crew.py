@@ -36,24 +36,21 @@ from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
+from agent.intent import TripSpecification, execute_trip_specification
 from agent.tools import (
     _WEATHER_ERROR_MESSAGES,
     _lookup_place_structured,
     _places_near,
+    _resolve_place,
     _search_places_rows,
     _weather_structured,
     connect,
     get_cached_tool_calls,
+    get_trip_start,
     haversine_km,
-    place_details,
     reset_tool_call_cache,
-    search_place_live,
-    search_places,
-    search_places_near,
     set_trip_start,
-    top_quality_places,
     travel_fields,
-    travel_time_estimate,
     weather_conditions,
 )
 from api.ranking import _CATEGORY_KEYWORDS, normalize_text
@@ -286,6 +283,42 @@ class TripPlanOutput(BaseModel):
     )
 
 
+class PlaceNarration(BaseModel):
+    """One place's prose, and NOTHING else — the Concierge's output schema
+    is deliberately this narrow (not the full PlaceRecommendation) so the
+    LLM can never re-type a number agent/intent.py's execute_trip_
+    specification() already computed deterministically. This is the
+    structural fix for the exact risk the old single-shot TripPlanOutput
+    schema carried: asking an LLM to reproduce recommendation_confidence/
+    distance_km/near_distance_km itself in its structured output is asking
+    it to transcribe data it didn't compute — precisely the failure mode
+    _reconcile_near_relationships() used to exist to clean up after the
+    fact. Here there is nothing numeric to transcribe in the first place."""
+
+    name: str = Field(description="Must exactly match one of the place names given to you — never a place you weren't given")
+    why_recommended: str = Field(description="1-2 sentences on why this place fits the request, grounded only in the facts given")
+
+
+class ConciergeNarration(BaseModel):
+    """The Concierge's entire output after the architecture change: prose
+    only, grounded in already-computed, already-validated facts. weather_
+    summary/overall_note are still free text, but every numeric/factual
+    field a traveler sees (recommendation_confidence, distances,
+    near_place, category, hours, ...) now comes from agent/intent.py's
+    execute_trip_specification() and is merged in by plain Python
+    (_execution_results_to_place_recommendations, below) — the LLM never
+    gets a chance to alter it."""
+
+    weather_summary: str = Field(description="1-2 sentences on real conditions for the target date, from your own weather_conditions call")
+    overall_note: str = Field(
+        default="",
+        description="2-4 sentences tying the whole recommendation together, like a real concierge "
+        "speaking — grounded only in the places and facts you were given, never inventing a place, "
+        "score, distance, or relationship that wasn't already provided to you.",
+    )
+    place_narrations: list[PlaceNarration] = Field(default_factory=list)
+
+
 GROUNDING_RULE = (
     "Only state facts your tools actually returned. If a tool found nothing "
     "or a date is out of range, say so plainly instead of guessing or "
@@ -347,179 +380,174 @@ def _instrument_llm(llm):
     return llm
 
 
-def build_crew(llm_kwargs: dict | None = None) -> Crew:
-    from crewai import LLM
-
-    llm = _instrument_llm(LLM(**(llm_kwargs or build_llm())))
-
-    place_scout = Agent(
-        role="Place Scout",
-        goal="Find Copenhagen places that genuinely match what the traveler is asking for.",
+def build_intent_crew(llm) -> Crew:
+    """The new intent-extraction crew — a single tool-less agent whose only
+    job is to turn free-text into a validated TripSpecification
+    (agent/intent.py). Deliberately no tools: the whole point of this
+    architecture change is that the LLM no longer chooses which
+    database/search function to call (see PROJECT_ARCHITECTURE_REPORT.md
+    §16) — it only classifies intent into structured fields, which the
+    backend then executes deterministically via
+    agent.intent.execute_trip_specification(). Uses the exact same
+    output_pydantic + instructor mechanism already proven on the old
+    concierge_task, just applied one step earlier in the pipeline."""
+    intent_analyst = Agent(
+        role="Trip Intent Analyst",
+        goal="Turn the traveler's free-text request into a precise, structured itinerary specification.",
         backstory=(
-            "You know Copenhagen's places inventory cold. You never suggest a place "
-            "your tools didn't actually return. " + GROUNDING_RULE
+            "You understand Copenhagen trip requests deeply, but you never search a database or "
+            "invent a distance yourself — your only job is to classify what the traveler actually "
+            "said into structured fields the backend will execute exactly. You are especially careful "
+            "never to let a sequence word like 'then' or 'afterwards' imply a spatial relationship — "
+            "sequence and proximity are always separate questions."
         ),
-        tools=[search_places, search_places_near, top_quality_places, search_place_live],
+        tools=[],
         llm=llm,
         max_iter=MAX_AGENT_ITER,
         verbose=True,
     )
 
-    concierge = Agent(
-        role="Concierge",
-        goal="Turn the scouted places and real conditions into one honest, specific recommendation.",
-        backstory=(
-            "You write the final answer a traveler actually reads. You pull rich detail "
-            "(recommendation confidence, vibe cluster, rated aspects, AI summary with sources) for "
-            "each place you recommend, check real weather and the Outdoor Interest Index "
-            "before anyone commits to an itinerary, and you never oversell a place with "
-            "thin evidence. " + GROUNDING_RULE
-        ),
-        tools=[place_details, travel_time_estimate, weather_conditions],
-        llm=llm,
-        max_iter=MAX_AGENT_ITER,
-        verbose=True,
-    )
-
-    scout_task = Task(
+    intent_task = Task(
         description=(
             "Traveler request: {request}\n\n"
-            "IMPORTANT: call each tool AT MOST ONCE per part of the request — never call the same "
-            "tool with the same arguments a second time. The moment your tool results cover every "
-            "part of the request, stop calling tools and give your final answer immediately; do not "
-            "re-call a tool you already have a result from just to double-check it.\n\n"
-            "First, work out what parts of the request you need to cover — a request can have more "
-            "than one part (e.g. 'see the Little Mermaid AND have coffee nearby' has two parts: a "
-            "named place, and an open-ended category). Cover every part, but only that many:\n"
-            "- A named place (e.g. 'the Little Mermaid', 'Torvehallerne') → find just that place, "
-            "confirm it exists. Do not add unrelated extra candidates for this part.\n"
-            "- An open-ended part that says it's near/close to/around ANOTHER specific named place "
-            "THE TRAVELER ACTUALLY NAMED (e.g. 'coffee nearby' when a landmark was also named, 'a "
-            "hotel near Torvehallerne') → use search_places_near with that other place as the anchor "
-            "and a small limit (2-3, its default) unless the traveler clearly asked for more options — "
-            "a few genuinely close picks beat a long list. This ranks by real geographic distance, not "
-            "wording — do not use search_places for this, since text similarity alone doesn't mean "
-            "something is actually close by. NEVER invent an anchor place yourself (e.g. assuming "
-            "'somewhere to see art' means near a specific museum you thought of) — only use "
-            "search_places_near when the traveler's own words named a real reference point.\n"
-            "- An open-ended part with NO reference point the traveler named (a vibe, category, or "
-            "theme, e.g. 'a cozy cafe somewhere in the city', 'somewhere quiet to see art') → use "
-            "ONLY search_places (vibe/description match), not top_quality_places and not "
-            "search_places_near — find 1-3 real candidates. Only use top_quality_places instead of "
-            "search_places when the traveler explicitly asked for the best/top-rated places, not as "
-            "an extra source alongside search_places for the same request.\n"
-            "After search_places returns results, only keep the ones that genuinely fit the theme — "
-            "e.g. for 'quiet art', a museum or gallery fits; a hotel or generic restaurant that merely "
-            "scored a moderate text-similarity number does not, even if the tool returned it. Use your "
-            "own judgment on relevance, not just whatever the tool ranked highest — a shorter list of "
-            "genuine matches beats a padded list of loose ones, and every extra irrelevant place "
-            "candidate costs real tokens downstream.\n"
-            "If the request is ONLY a named place with no open-ended part, return just that place. "
-            "If it's ONLY open-ended with no named place, return up to 3-5 candidates for it — fewer "
-            "if fewer genuinely fit. If it's both, return both parts — do not silently drop the "
-            "open-ended part just because a named place was also mentioned. List only places your "
-            "tools actually returned.\n\n"
-            "If a NAMED place isn't found by search_places, search_places_near, or top_quality_places "
-            "at all, try search_place_live as a last resort before giving up on it — it checks whether "
-            "the place genuinely exists in Copenhagen even though it's outside our curated, scored "
-            "dataset. Clearly note in your findings that it came from a live lookup, not the dataset."
+            "Break this request into one or more itinerary parts, in the order the traveler wants to "
+            "visit them (sequence_index starting at 0). A request can have more than one part — e.g. "
+            "'see the Little Mermaid AND have coffee nearby' has two parts: a named place, and an "
+            "open-ended category.\n\n"
+            "For EACH part, decide:\n"
+            "- query: the traveler's own wording for this part.\n"
+            "- named_place: true only if the traveler named one specific real place (e.g. 'the Little "
+            "Mermaid', 'Torvehallerne', 'Rundetårn'); false for an open-ended category/vibe (e.g. 'a "
+            "cozy cafe', 'somewhere to see art').\n"
+            "- category: one of restaurant/cafe/hotel/landmark/bar if implied, else omit it — never "
+            "invent one.\n"
+            "- relation: decide this using ONLY explicit wording in the request, checked IN THIS "
+            "ORDER — an explicit spatial word always wins over a bare sequence word, and a sequence "
+            "word ALONE never implies a spatial relationship, no matter what:\n"
+            "  1) EXPLICIT DISTANCE/FAR wording (far away, far from, somewhere distant, elsewhere, a "
+            "different area, not near) → relation=far. This wins even if a sequence word or a named "
+            "place also appears in the request. Example: 'see the Little Mermaid and THEN go to a "
+            "cafe FAR AWAY' → the coffee part is relation=far, NOT near — the explicit 'far away' "
+            "overrides the sequence word 'then' completely.\n"
+            "  2) EXPLICIT PROXIMITY wording (near/nearby/close to/close by/around/next to/on the way "
+            "to/within [a distance]/walking distance) → relation=near. If it points at another place "
+            "the traveler actually named anywhere in the request, set anchor_query to that place's own "
+            "wording (it only has to be named once, anywhere in the request). If it instead refers to "
+            "the traveler's OWN starting point ('near me', 'close to where I'm staying'), set "
+            "anchor_is_start_location=true instead, and leave anchor_query empty. If the traveler gave "
+            "an approximate distance ('within 1 km' → 1.0, 'walking distance' → about 1.5), set "
+            "max_distance_km to it. NEVER invent an anchor yourself — only use relation=near when the "
+            "traveler's own words actually used a proximity word.\n"
+            "  3) An explicit neighborhood/area name with no specific place named (e.g. 'around "
+            "Nørrebro', 'somewhere in Vesterbro') → relation=area, with neighborhood set to that name.\n"
+            "  4) NEITHER explicit distance/far wording NOR explicit proximity/area wording — "
+            "including a part introduced ONLY by a sequence word with nothing else spatial (e.g. 'see "
+            "the Little Mermaid and then have coffee' — 'then' alone states an order, not a location) "
+            "→ relation=sequential for a non-first part with no reference point, or relation=primary "
+            "for the main/first part of the request. Do not invent a near-relationship just because "
+            "one wasn't explicitly ruled out.\n"
+            "- min_distance_km: only if the traveler gave an explicit numeric lower bound for a "
+            "relation=far part (e.g. 'at least 2 km away') — rare, omit otherwise.\n\n"
+            "If the request is ONLY a named place with no open-ended part, return just that one part "
+            "(relation=primary). If it's ONLY open-ended, return that one part. If it's both, return "
+            "both parts — do not silently drop one just because the other was also mentioned."
         ),
         expected_output=(
-            "Every distinct part of the request covered: the named place if one was given, and/or "
-            "candidates for the open-ended part if one was given — each with category and "
-            "neighborhood. Never fewer parts than the request actually asked for. If a named place "
-            "was only found via search_place_live, say so explicitly instead of presenting it as an "
-            "ordinary dataset result."
+            "A TripSpecification whose parts cover every distinct part of the request — the named "
+            "place if one was given, and/or the open-ended part(s) if given — each with the correct "
+            "relation chosen strictly from explicit wording, never inferred from a sequence word alone."
         ),
-        agent=place_scout,
+        agent=intent_analyst,
+        output_pydantic=TripSpecification,
+    )
+
+    return Crew(agents=[intent_analyst], tasks=[intent_task], process=Process.sequential, verbose=True)
+
+
+def build_concierge_crew(llm) -> Crew:
+    """The narration-only Concierge — after the architecture change, every
+    numeric/factual field (recommendation_confidence, distances,
+    near_place, category, hours, ...) is already computed deterministically
+    by agent.intent.execute_trip_specification() before this crew ever
+    runs (see _run_structured_trip_plan below). The Concierge's only
+    remaining job is: check real weather, then write grounded prose —
+    output_pydantic=ConciergeNarration structurally prevents it from
+    re-typing any number it was given, since ConciergeNarration has no
+    numeric fields at all."""
+    concierge = Agent(
+        role="Concierge",
+        goal="Write an honest, specific recommendation grounded only in the real places and facts you're given.",
+        backstory=(
+            "You write the final answer a traveler actually reads. Every place, score, distance, and "
+            "relationship you're given is already real and already verified — your job is only to "
+            "explain it warmly and check real weather, never to invent or restate a number "
+            "differently than you were given it. " + GROUNDING_RULE
+        ),
+        tools=[weather_conditions],
+        llm=llm,
+        max_iter=MAX_AGENT_ITER,
+        verbose=True,
     )
 
     concierge_task = Task(
         description=(
-            "IMPORTANT: never call the same tool with the same arguments twice — one batched "
-            "place_details call, one weather_conditions call, and one batched travel_time_estimate "
-            "call (if a start location was given) is enough; the moment you have those results, stop "
-            "calling tools and write your final answer.\n\n"
-            "Call weather_conditions once for target date {target_date} to get real weather and "
+            "Traveler request: {request}\n"
+            "Traveler's starting point: {start_location}\n\n"
+            "Call weather_conditions ONCE for target date {target_date} to get real weather and "
             "outdoor-interest conditions — if the date is out of the stored range, report that "
-            "plainly in weather_summary instead of guessing.\n\n"
-            "Using the Place Scout's candidates, call "
-            "place_details ONCE with every place the Scout returned, comma-separated, for: "
-            "{request} (target date: {target_date}) — never call place_details separately per "
-            "place, that wastes tokens and risks a rate limit. If the Scout covered multiple parts "
-            "of the request, include a result for each; don't collapse to one place. Fill name/"
-            "category/neighborhood/opening_hours/recommendation_confidence/recommendation_label/"
-            "vibe_cluster/summary/sources from place_details' actual output — null if unavailable, "
-            "never guessed. recommendation_confidence and recommendation_label are exactly what "
-            "place_details' \"Recommendation confidence\" line says, a live estimate of how likely "
-            "this place is to be a good recommendation, not an objective quality rating — report "
-            "them as returned, don't reinterpret or round them. Don't recommend a place you didn't "
-            "get from place_details.\n\n"
-            "For a place the Scout found via search_place_live: check what that tool's own result "
-            "text said. If it said the place is already in our database under a different name, or "
-            "that it was found and added with real evidence, INCLUDE it in the same batched "
-            "place_details call using the name that result gave you — it now has real data. Only if "
-            "search_place_live said no evidence could be found (or the category was unclear) should "
-            "you leave it out of place_details and leave recommendation_confidence/"
-            "recommendation_label/vibe_cluster/summary/sources null for it — never guess a "
-            "confidence for a place with no real evidence behind it.\n\n"
-            "why_recommended and overall_note must sound like a real concierge talking to a "
-            "traveler, not a system describing itself: never mention how a place was found (a "
-            "tool, 'live lookup', 'our database'), and never comment on what data is/isn't "
-            "available ('hours are known', 'not in our dataset'). Missing means simply not "
-            "mentioning it, not announcing the gap.\n\n"
-            "If the Scout noted a real search_places_near distance (e.g. '0.32 km from X'), set "
-            "near_place and near_distance_km to that exact value — never invent or round it. Null "
-            "for places found any other way.\n\n"
-            "weather_summary: required, 1-2 sentences from your own weather_conditions call. "
-            "overall_note: required, 2-4 sentences tying the recommendation together like a real "
-            "concierge speaking — never empty. Weave the real weather from weather_conditions and "
-            "the real distance/travel time from travel_time_estimate (if a starting point was "
-            "given) naturally into this note as plain, warm sentences — 'it'll be a sunny "
-            "22 degrees, an easy 15-minute walk from your hotel', not a separate report. If weather "
-            "or distance genuinely couldn't be determined, simply don't mention it — never say "
-            "'the weather forecast is not available' or similar; an omission reads as normal "
-            "conversation, an announced gap reads as a system apologizing for itself.\n\n"
-            "Traveler's starting point: {start_location}. If given (not 'not provided'), call "
-            "travel_time_estimate ONCE with every place name comma-separated (same rule as "
-            "place_details — one call, not one per place) and fill distance_km/walk_minutes/"
-            "bike_minutes/travel_note. If not given, leave those four null — never guess a location."
+            "plainly in weather_summary instead of guessing. Do not call any other tool.\n\n"
+            "Here are the real places already found and scored for this request — this is the "
+            "complete, final set; do not add, remove, or rename any place, and do not restate or "
+            "reinterpret any of their numbers:\n\n{scouted_places}\n\n"
+            "For each place above, write a 1-2 sentence why_recommended that sounds like a real "
+            "concierge talking to a traveler, not a system describing itself: never mention how a "
+            "place was found (a tool, 'live lookup', 'our database'), and never comment on what data "
+            "is/isn't available ('hours are known', 'not in our dataset') — missing means simply not "
+            "mentioning it. If a place's distance is given as 'from X' (not 'from your start'), "
+            "describe it relative to X in your prose — e.g. 'a 4-minute walk from the Little "
+            "Mermaid' — never as distance from the traveler's own start; that would describe a "
+            "different, less relevant question for that place.\n\n"
+            "overall_note: required, 2-4 sentences tying the whole recommendation together like a "
+            "real concierge speaking — weave in the real weather and any given distances naturally, "
+            "but only facts you were actually given above or from your own weather_conditions call. "
+            "Never invent a place, score, distance, or relationship that wasn't given to you."
         ),
         expected_output=(
-            "A TripPlanOutput: every place the Scout found (not just one, unless the Scout only "
-            "found one), each with its real recommendation confidence, hours, sources, and why it fits; "
-            "near_place/near_distance_km filled in for places found via search_places_near; a "
-            "weather summary for the target date; travel time fields filled in only if a "
-            "starting point was given; and a real 2-4 sentence overall_note tying the "
-            "recommendation together."
+            "A ConciergeNarration: a why_recommended for every place listed above (matching names "
+            "exactly), a real weather_summary from your own weather_conditions call, and a genuine "
+            "2-4 sentence overall_note."
         ),
         agent=concierge,
-        context=[scout_task],
-        output_pydantic=TripPlanOutput,
+        output_pydantic=ConciergeNarration,
     )
 
-    return Crew(
-        agents=[place_scout, concierge],
-        tasks=[scout_task, concierge_task],
-        process=Process.sequential,
-        verbose=True,
-    )
+    return Crew(agents=[concierge], tasks=[concierge_task], process=Process.sequential, verbose=True)
 
 
-def _extract(crew_output) -> TripPlanOutput:
-    """crew_output.pydantic is populated when output_pydantic parsing
-    succeeds; falls back to wrapping the raw text in a single-field
-    TripPlanOutput if the model's final answer couldn't be coerced into the
-    schema — rare (instructor retries internally), but a fallback beats a
-    hard crash on an otherwise-successful crew run."""
+def _extract_spec(crew_output) -> TripSpecification:
+    """Unlike _extract above, there's no reasonable fallback for a
+    TripSpecification that failed to parse — a single-field "raw text"
+    wrapper isn't executable by execute_trip_specification(). Raises
+    TripPlannerLLMUnavailable instead (instructor already retries
+    internally on a validation error; this only fires if every retry was
+    exhausted), which api/main.py already treats as "fall back to the
+    deterministic planner" — the same honest degradation path a real
+    OpenAI outage takes."""
     if crew_output.pydantic is not None:
         return crew_output.pydantic
-    log.warning("Concierge output didn't parse into TripPlanOutput, falling back to raw text")
-    return TripPlanOutput(
-        places=[],
-        weather_summary="",
-        overall_note=str(crew_output),
-    )
+    raise TripPlannerLLMUnavailable("Intent extraction did not produce a valid TripSpecification")
+
+
+def _extract_narration(crew_output) -> ConciergeNarration:
+    """Same reasoning as _extract_spec — a ConciergeNarration that failed
+    to parse has no safe partial-text fallback here (unlike the old
+    single-shot TripPlanOutput, where the whole response was prose
+    anyway); _run_structured_trip_plan's caller already has real,
+    deterministically-computed places in hand and can synthesize an
+    honest response from those alone (_synthesize_without_concierge)."""
+    if crew_output.pydantic is not None:
+        return crew_output.pydantic
+    raise TripPlannerLLMUnavailable("Concierge narration did not produce valid output")
 
 
 # Rolling window, not a hard daily reset — real Groq usage today (heavy
@@ -592,11 +620,15 @@ def _recompute_travel(result: dict, start_lat: float, start_lon: float, start_la
     """Zero LLM cost: looks up each cached place's real coordinates and
     recalculates distance/walk/bike time from a NEW starting point, reusing
     travel_fields() so this stays consistent with the live tool's math and
-    thresholds. near_place/near_distance_km are untouched — those measure
-    distance to another recommended place, not to the traveler's start, so
-    a different starting point doesn't change them."""
+    thresholds. Skips any place with near_place already set — its relevant
+    distance is to that other recommended place, not to the traveler's own
+    start, so a different starting point must never overwrite it with a
+    start-relative distance_km (the same wrong-reference bug
+    _reconcile_near_relationships() exists to prevent elsewhere)."""
     with _cache_connect() as conn, conn.cursor() as cur:
         for place in result.get("places", []):
+            if place.get("near_place"):
+                continue
             cur.execute(
                 "SELECT lat, lon FROM places WHERE name ILIKE %(name)s "
                 "ORDER BY (lower(name) = lower(%(exact)s)) DESC LIMIT 1;",
@@ -639,6 +671,147 @@ def _place_recommendation_kwargs(
         dist_km = haversine_km(start_coords[0], start_coords[1], lat, lon)
         kwargs.update(travel_fields(dist_km))
     return kwargs
+
+
+def _reconcile_near_relationships(result: dict) -> dict:
+    """The real fix for a genuine class of bug: a place whose actual
+    relationship is 'near the place visited before it' (e.g. a café near
+    the Little Mermaid) was showing up with its distance FROM THE
+    TRAVELER'S OWN START LOCATION instead — a real, correctly-calculated
+    number, just the wrong reference point for that place. root cause:
+    the Concierge asks travel_time_estimate for every place in one batched
+    call, which unconditionally measures from the trip's start (see its
+    own docstring) — and separately has to correctly transcribe the
+    Scout's own near-distance text into near_place/near_distance_km,
+    a fragile hand-off between two LLM calls this function doesn't rely
+    on at all.
+
+    Instead of trusting anything the LLM wrote, this looks at which
+    search_places_near(anchor_place=...) calls the Scout ACTUALLY made
+    this request (get_cached_tool_calls — the exact real kwargs, not a
+    transcription) and independently re-derives the real anchor and real
+    haversine distance for every one of its real candidates straight from
+    the database — the same ground truth _compound_deterministic_places()
+    already uses for the no-LLM fallback path. For any place in the final
+    result that matches one of those real candidates, this overwrites
+    near_place/near_distance_km with the recomputed real value and clears
+    the start-relative distance_km/walk_minutes/bike_minutes/travel_note
+    fields, since 'X km from your start' is a real but wrong-reference
+    answer for a place whose relevant distance is to the place before it,
+    not to where the trip began.
+
+    General on purpose, not hardcoded to any place/category: works for
+    whatever anchor and category the Scout actually searched near, for
+    any request shape. A no-op when the Scout never called
+    search_places_near at all (a plain single-destination request, or a
+    request with no near-relationship) — existing single-destination
+    behavior is untouched. Safe to call on every response path (the live
+    crew run, the cache-reuse path, and — defensively — the deterministic
+    fallback), since _tool_call_cache reflects this request's real tool
+    calls regardless of which path ultimately produced the answer."""
+    near_calls = get_cached_tool_calls("search_places_near")
+    if not near_calls:
+        return result
+
+    anchor_cache: dict[str, tuple[str, float, float] | None] = {}
+    near_lookup: dict[str, tuple[str, float]] = {}
+
+    with connect() as conn, conn.cursor() as cur:
+        for call in near_calls:
+            anchor_place = str(call.get("anchor_place", "")).strip()
+            if not anchor_place:
+                continue
+            category = call.get("category", "") or ""
+            if anchor_place not in anchor_cache:
+                resolved = _resolve_place(cur, anchor_place)
+                anchor_cache[anchor_place] = (resolved[1], resolved[2], resolved[3]) if resolved else None
+            anchor = anchor_cache[anchor_place]
+            if anchor is None:
+                continue
+            anchor_name, anchor_lat, anchor_lon = anchor
+            # A generous limit (not the Scout's own, possibly smaller, one)
+            # so this matches any real nearby candidate the Concierge kept
+            # in its final answer, even if it's not literally the closest
+            # handful the Scout's own call happened to ask for.
+            rows = _places_near(cur, anchor_lat, anchor_lon, category=category, exclude_name=anchor_name, limit=20)
+            for r in rows:
+                near_lookup[r["name"].lower()] = (anchor_name, round(r["distance_km"], 2))
+
+    if not near_lookup:
+        return result
+
+    for place in result.get("places", []):
+        match = _find_near_match(str(place.get("name", "")), near_lookup)
+        if match is None:
+            continue
+        place["near_place"], place["near_distance_km"] = match
+        place["distance_km"] = None
+        place["walk_minutes"] = None
+        place["bike_minutes"] = None
+        place["travel_note"] = None
+
+    return result
+
+
+def _find_near_match(place_name: str, near_lookup: dict[str, tuple[str, float]]) -> tuple[str, float] | None:
+    """Real gap found live: the Concierge's final answer sometimes shortens
+    a place's real name (e.g. 'Terminalen kaffebar' for the database's real
+    'Terminalen kaffebar - Seaside Toldboden') — an exact lookup silently
+    misses that place, leaving its stale LLM-written distance_km
+    uncorrected even though its near_place/near_distance_km happened to be
+    right. Falls back to a substring match in either direction, which
+    still only ever matches within near_lookup's own already-constrained,
+    real, geographically-close candidate set — not a blanket fuzzy match
+    against anything."""
+    name_lower = place_name.lower().strip()
+    if not name_lower:
+        return None
+    if name_lower in near_lookup:
+        return near_lookup[name_lower]
+    for candidate_name, value in near_lookup.items():
+        if candidate_name in name_lower or name_lower in candidate_name:
+            return value
+    return None
+
+
+def _ensure_start_distance(result: dict) -> dict:
+    """Backfills distance_km/walk_minutes/bike_minutes/travel_note for any
+    place that's missing them despite a real starting point being given —
+    found live: the Concierge's own batched travel_time_estimate call
+    sometimes only names the SECONDARY places (a reasonable-looking
+    instinct once it correctly stopped treating them as start-relative —
+    see _reconcile_near_relationships above — but it then also has to
+    remember to separately ask for the PRIMARY place, which it doesn't
+    always do). Rather than trying to make that one LLM call reliably
+    cover every name every time, this deterministically fills the gap
+    afterward using the exact same real, already-geocoded start
+    coordinates (agent.tools.get_trip_start()) and the same haversine math
+    travel_time_estimate itself uses — zero extra LLM cost, and it only
+    ever fills a genuinely missing value, never overwrites one a tool
+    call already set. Never touches a place with near_place set — that
+    place's relevant distance is to another recommended place, not to the
+    trip's start (see _reconcile_near_relationships)."""
+    start = get_trip_start()
+    if start["lat"] is None:
+        return result
+
+    missing = [
+        p for p in result.get("places", [])
+        if not p.get("near_place") and p.get("distance_km") is None
+    ]
+    if not missing:
+        return result
+
+    with connect() as conn, conn.cursor() as cur:
+        for place in missing:
+            resolved = _resolve_place(cur, str(place.get("name", "")))
+            if resolved is None:
+                continue
+            _, _, lat, lon = resolved
+            dist_km = haversine_km(start["lat"], start["lon"], lat, lon)
+            place.update(travel_fields(dist_km))
+
+    return result
 
 
 def _weather_summary_text(weather: dict, target_date: str) -> str:
@@ -756,10 +929,15 @@ def _compound_deterministic_places(cur, conn, split: dict, start_coords: tuple[f
             detail = _lookup_place_structured(cur, conn, r["name"])
             if detail is None:
                 continue
+            # No start_coords here, deliberately: this place's relevant
+            # distance is to the primary place (near_distance_km below),
+            # not to the traveler's own start — passing start_coords would
+            # compute a real but wrong-reference distance_km, the exact
+            # bug _reconcile_near_relationships() exists to undo on the
+            # live-LLM path (see its own docstring).
             kwargs = _place_recommendation_kwargs(
                 detail,
                 why=f"Near {primary_detail['name']}, matching your request for {split['secondary_category']}.",
-                start_coords=start_coords,
                 lat=r.get("lat"),
                 lon=r.get("lon"),
             )
@@ -931,12 +1109,302 @@ def _trip_plan_from_cached_results(request: str, target_date: str, start_locatio
         "specific search."
     )
 
+    result = TripPlanOutput(places=places, weather_summary=weather_summary, overall_note=overall_note).model_dump()
+    # This loop gave every place a start-relative distance unconditionally
+    # (it has no concept of "primary" vs "near X" place) — reconcile
+    # against the Scout's real search_places_near calls from earlier in
+    # this same request (still in _tool_call_cache) so a secondary place
+    # gets its real near_place/near_distance_km instead of a wrong-
+    # reference "X km from your start."
+    return _ensure_start_distance(_reconcile_near_relationships(result))
+
+
+def _format_execution_results_for_concierge(results: list[dict]) -> str:
+    """Formats agent.intent.execute_trip_specification()'s real, already-
+    scored results into text for concierge_task — the Concierge's
+    replacement for calling place_details/travel_time_estimate itself.
+    Mirrors place_details()'s own text-formatting style (agent/tools.py)
+    so the Concierge sees the same shape of information it always has,
+    just already-computed rather than fetched via a tool call."""
+    if not results:
+        return "No places were found matching this request."
+
+    blocks = []
+    for r in results:
+        lines = [f"{r['name']} ({r['category']}, {r['neighborhood']})"]
+        if r.get("opening_hours"):
+            lines.append(f"Opening hours: {r['opening_hours']}")
+        if r["recommendation_confidence"] is not None:
+            lines.append(f"Recommendation confidence: {r['recommendation_confidence']}% ({r['recommendation_label']})")
+        else:
+            lines.append("Recommendation confidence: not available")
+        if r.get("vibe_cluster"):
+            lines.append(f"Vibe cluster: {r['vibe_cluster']}")
+        if r.get("summary"):
+            lines.append(f"AI summary: {r['summary']}")
+        if r.get("near_place"):
+            lines.append(
+                f"Distance: {r['near_distance_km']:.2f} km from {r['near_place']} — this IS the "
+                "relevant distance for this place; do not describe it as distance from the "
+                "traveler's own start."
+            )
+        elif r.get("distance_km") is not None:
+            note = f" — {r['travel_note']}" if r.get("travel_note") else ""
+            lines.append(f"Distance from traveler's start: {r['distance_km']:.1f} km{note}")
+        if r.get("execution_note"):
+            lines.append(f"Note: {r['execution_note']}")
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
+
+
+def _match_narration(name: str, why_lookup: dict[str, str]) -> str | None:
+    """Same exact/substring-both-ways matching strategy as _find_near_match
+    above, applied to the Concierge's place_narrations instead of a
+    near-distance lookup — handles the same real gap (the LLM shortening
+    or lightly rewording a place's own name in its structured output)."""
+    name_lower = name.lower().strip()
+    if name_lower in why_lookup:
+        return why_lookup[name_lower]
+    for candidate, why in why_lookup.items():
+        if candidate in name_lower or name_lower in candidate:
+            return why
+    return None
+
+
+def _default_why_recommended(r: dict) -> str:
+    """Plain, honest fallback prose — used only when no Concierge
+    narration is available at all (_synthesize_without_concierge) or the
+    Concierge's output didn't include this specific place by name."""
+    if r.get("near_place"):
+        return f"Found near {r['near_place']}, matching your request."
+    return "Matches your request, with a real recommendation confidence from our database."
+
+
+def _execution_results_to_place_recommendations(
+    results: list[dict], narration: ConciergeNarration | None
+) -> list[PlaceRecommendation]:
+    """Merges agent.intent.execute_trip_specification()'s deterministic
+    facts with the Concierge's prose (or an honest default if narration
+    is None — the degraded no-Concierge path). This is the ONE place
+    numeric fields and LLM-written prose come back together — every
+    numeric field below comes from `results`, never from `narration`."""
+    why_lookup = {pn.name.lower().strip(): pn.why_recommended for pn in narration.place_narrations} if narration else {}
+
+    places = []
+    for r in results:
+        why = _match_narration(r["name"], why_lookup) or _default_why_recommended(r)
+        places.append(
+            PlaceRecommendation(
+                name=r["name"],
+                category=r["category"],
+                neighborhood=r["neighborhood"],
+                opening_hours=r.get("opening_hours"),
+                recommendation_confidence=r["recommendation_confidence"],
+                recommendation_label=r["recommendation_label"],
+                vibe_cluster=r.get("vibe_cluster"),
+                summary=r.get("summary"),
+                sources=r.get("sources") or [],
+                distance_km=r.get("distance_km"),
+                walk_minutes=r.get("walk_minutes"),
+                bike_minutes=r.get("bike_minutes"),
+                travel_note=r.get("travel_note"),
+                near_place=r.get("near_place"),
+                near_distance_km=r.get("near_distance_km"),
+                why_recommended=why,
+            )
+        )
+    return places
+
+
+# Real, live-observed gap: even with the structured intent layer making
+# near_place/near_distance_km fully deterministic, the Concierge's own
+# free-text prose sometimes still used casual proximity language for a
+# place whose real, computed near_place was None — e.g. real overall_note
+# text observed in testing: "...unwind at one of the cozy cafes nearby..."
+# for cafes that were actually 3-6 km away (relation=sequential/far, not
+# near). Fixed here deterministically, NOT by adding more prompt text
+# (concierge_task's description is unchanged) — the whole point of this
+# architecture is not to keep trusting the LLM to self-censor reliably.
+_FALSE_PROXIMITY_PHRASES = (
+    "nearby", "near by", "close by", "closeby", "short walk", "steps away",
+    "stone's throw", "stones throw", "around the corner", "right next to",
+    "next door", "walking distance", "a few minutes away", "just minutes away",
+    # Found live during end-to-end verification (real overall_note/
+    # why_recommended text for a relation=sequential place, e.g. "Its
+    # proximity to the landmark...", "Located not far from the Little
+    # Mermaid...") — same false-claim class, added to the same list
+    # rather than a new mechanism.
+    "proximity to", "not far from", "close to the",
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+# Bare "near" is deliberately NOT in _FALSE_PROXIMITY_PHRASES above — found
+# live: "conveniently located near several cozy cafes" for cafes actually
+# 2.87-5.04 km away IS a false claim, but banning the word outright would
+# also strip a real, unrelated geographic aside like "a prime location
+# near the lakes" (real Hotel Nora prose, Test H — true and harmless).
+# The two are told apart by what follows "near": a false claim always
+# describes the itinerary itself (a generic category noun for the
+# traveler's own recommended places, or one of those places by name); an
+# unrelated landmark reference never does. This stays a local, deterministic
+# text check — no NLP model, no extra LLM call.
+_NEAR_WORD_RE = re.compile(r"\bnear\b(?!\s+(?:by|future))", re.IGNORECASE)
+_ITINERARY_NOUN_WORDS = {
+    "cafe", "cafes", "café", "cafés", "restaurant", "restaurants", "hotel", "hotels",
+    "bar", "bars", "landmark", "landmarks", "spot", "spots", "place", "places",
+    "option", "options", "stop", "stops",
+}
+_WORD_RE = re.compile(r"[a-zà-öø-ÿ']+")
+
+
+def _bare_near_refers_to_itinerary(text: str, place_names: frozenset[str]) -> bool:
+    """True only when a bare 'near' in the text is followed (within a
+    short window) by a generic itinerary noun or one of the OTHER
+    recommended places' own names — i.e. only when it's actually
+    describing the itinerary relationship this guard polices, not an
+    unrelated real-world landmark."""
+    for m in _NEAR_WORD_RE.finditer(text):
+        window = text[m.end(): m.end() + 40].lower()
+        if set(_WORD_RE.findall(window)) & _ITINERARY_NOUN_WORDS:
+            return True
+        if any(name and name in window for name in place_names):
+            return True
+    return False
+
+
+def _contains_proximity_claim(text: str, place_names: frozenset[str] = frozenset()) -> bool:
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in _FALSE_PROXIMITY_PHRASES):
+        return True
+    return _bare_near_refers_to_itinerary(text, place_names)
+
+
+def _strip_proximity_sentences(text: str, place_names: frozenset[str] = frozenset()) -> str:
+    """Removes only the sentence(s) making the false claim, keeping
+    whatever other real content (weather, a true distance for a different
+    place) the Concierge wrote — a smaller edit than discarding the whole
+    field."""
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s]
+    kept = [s for s in sentences if not _contains_proximity_claim(s, place_names)]
+    return " ".join(kept).strip()
+
+
+def _enforce_narration_matches_deterministic_relationships(
+    results: list[dict], narration: ConciergeNarration
+) -> ConciergeNarration:
+    """Deterministic backend guard: never edits a TRUE proximity claim (a
+    place that genuinely has near_place set keeps its prose untouched) —
+    only removes a claim attached to a place whose real, computed
+    near_place is None. Same reasoning for overall_note: only scrubbed
+    when NO place in the result set has a near relationship at all, since
+    otherwise the phrase might correctly describe the one that does."""
+    near_place_by_name = {r["name"].lower().strip(): bool(r.get("near_place")) for r in results}
+    has_any_near_place = any(near_place_by_name.values())
+    all_place_names = frozenset(near_place_by_name.keys())
+
+    for pn in narration.place_narrations:
+        if near_place_by_name.get(pn.name.lower().strip(), False):
+            continue
+        if _contains_proximity_claim(pn.why_recommended, all_place_names):
+            match = next((r for r in results if r["name"].lower().strip() == pn.name.lower().strip()), None)
+            pn.why_recommended = (
+                _default_why_recommended(match) if match
+                else _strip_proximity_sentences(pn.why_recommended, all_place_names)
+            )
+
+    if not has_any_near_place and _contains_proximity_claim(narration.overall_note, all_place_names):
+        narration.overall_note = _strip_proximity_sentences(narration.overall_note, all_place_names) or (
+            "Here's your plan based on real, matching places for your request."
+        )
+
+    return narration
+
+
+def _synthesize_without_concierge(results: list[dict], target_date: str) -> dict:
+    """Honest degraded response for the specific new failure mode this
+    architecture introduces: intent extraction succeeded and
+    execute_trip_specification() already produced real, scored places —
+    but the Concierge's own final narration call then failed (OpenAI
+    outage, or MAX_LLM_CALLS_PER_REQUEST hit on the 2nd of 2 calls this
+    architecture now needs per request). Unlike the old
+    _trip_plan_from_cached_results (which recovered partial work via
+    agent.tools' tool-call cache — no longer populated the same way now
+    that the Scout doesn't call search tools), this recovers directly
+    from the real Python results already in hand, with zero LLM cost,
+    same honest-about-being-degraded tone as deterministic_trip_plan()."""
+    places = _execution_results_to_place_recommendations(results, narration=None)
+
+    weather = _weather_structured(target_date)
+    weather_summary = _weather_summary_text(weather, target_date)
+
+    if places:
+        overall_note = (
+            "Our AI trip-planning assistant found and scored these real places for your request, but "
+            "hit a temporary limit with its language-model provider right at the final write-up step "
+            "— shown here with their real recommendation confidence and distances rather than being "
+            "discarded. Try again shortly for the full AI-narrated experience."
+        )
+    else:
+        overall_note = (
+            "Our AI trip-planning assistant hit a temporary limit with its language-model provider, "
+            "and no matching places were found for this request either. Please try again shortly."
+        )
+
     return TripPlanOutput(places=places, weather_summary=weather_summary, overall_note=overall_note).model_dump()
+
+
+def _run_structured_trip_plan(request: str, target_date: str, start_location: str) -> dict:
+    """The new live-LLM path: intent extraction (1 LLM call, no tools) →
+    deterministic backend execution (0 LLM calls — agent.intent.
+    execute_trip_specification, real search/scoring/distance math) →
+    Concierge narration (1 LLM call, weather_conditions only). Two LLM
+    calls total per request, both structured, versus the old
+    architecture's variable, tool-call-heavy Scout + Concierge exchange.
+
+    Both crews share ONE instrumented llm instance so
+    MAX_LLM_CALLS_PER_REQUEST/_llm_call_count (both request-scoped, see
+    plan_trip below) correctly cover the whole request, not just one
+    crew."""
+    from crewai import LLM
+
+    llm = _instrument_llm(LLM(**build_llm()))
+
+    spec_output = build_intent_crew(llm).kickoff(inputs={"request": request})
+    spec = _extract_spec(spec_output)
+    log.info(f"TripSpecification: {spec.model_dump()}")
+
+    execution_results = execute_trip_specification(spec)
+    log.info(f"execute_trip_specification: {len(execution_results)} place(s) found/scored deterministically")
+
+    concierge_inputs = {
+        "request": request,
+        "target_date": target_date,
+        "start_location": start_location.strip() or "not provided",
+        "scouted_places": _format_execution_results_for_concierge(execution_results),
+    }
+    try:
+        narration_output = build_concierge_crew(llm).kickoff(inputs=concierge_inputs)
+        narration = _extract_narration(narration_output)
+        narration = _enforce_narration_matches_deterministic_relationships(execution_results, narration)
+    except TripPlannerLLMUnavailable as e:
+        log.warning(
+            f"Intent extraction succeeded and {len(execution_results)} place(s) were already "
+            f"deterministically found/scored, but the Concierge's final narration call failed ({e}) "
+            "— synthesizing an honest response from the real results already in hand."
+        )
+        return _synthesize_without_concierge(execution_results, target_date)
+
+    places = _execution_results_to_place_recommendations(execution_results, narration)
+    return TripPlanOutput(
+        places=places, weather_summary=narration.weather_summary, overall_note=narration.overall_note,
+    ).model_dump()
 
 
 def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
     """Never retries an OpenAI failure or a MAX_LLM_CALLS_PER_REQUEST hit —
-    both surface as TripPlannerLLMUnavailable (see build_crew/_instrument_llm).
+    both surface as TripPlannerLLMUnavailable (see _run_structured_trip_plan/
+    _instrument_llm).
     A retry here means re-running the ENTIRE crew from scratch, not just the
     one failed call, so on a small, fixed API budget an automatic retry is
     gambling a full run's worth of tokens rather than just failing fast and
@@ -977,11 +1445,6 @@ def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
     else:
         set_trip_start(None, None, "")
 
-    inputs = {
-        "request": request,
-        "target_date": target_date,
-        "start_location": start_location.strip() or "not provided",
-    }
     # Reset before every real crew execution — a fresh, request-scoped
     # slate for both the identical-tool-call cache (agent/tools.py) and the
     # MAX_LLM_CALLS_PER_REQUEST counter (_instrument_llm) — neither is a
@@ -989,11 +1452,12 @@ def plan_trip(request: str, target_date: str, start_location: str = "") -> dict:
     reset_tool_call_cache()
     _llm_call_count.set(0)
     try:
-        result = _extract(build_crew().kickoff(inputs=inputs)).model_dump()
+        result = _run_structured_trip_plan(request, target_date, start_location)
     except TripPlannerLLMUnavailable as e:
         log.warning(f"OpenAI unavailable, not retrying (a retry re-runs the whole crew): {e}")
         raise
 
+    result = _ensure_start_distance(_reconcile_near_relationships(result))
     _save_cache(request, target_date, start_location, result)
 
     return result
