@@ -259,18 +259,71 @@ class ForecastPoint(BaseModel):
     avg_interest: float
 
 
+class ModelEvaluationMetric(BaseModel):
+    label: str
+    value: float
+    description: str
+
+
+class ModelEvaluation(BaseModel):
+    """A small, static presentation of the recommendation model's own,
+    already-established offline evaluation results — NOT computed here,
+    NOT queried from the database, and NOT recomputed per request. These
+    are the real, previously-verified numbers from the model's actual
+    training/evaluation runs (see docs/architecture.md's "Recommendation
+    scoring" section for the full investigation and re-verification
+    history) — this class only presents them, it doesn't calculate them."""
+
+    metrics: list[ModelEvaluationMetric]
+
+
+# Static, hand-verified against docs/architecture.md (the authoritative,
+# most-recently re-verified source — see its "Real, measured result of
+# the replacement" and "Verified, not assumed" sections). Deliberately a
+# plain constant, not a query: these are one-time offline evaluation
+# results from real training/evaluation runs, not something that changes
+# per request or needs live computation. Macro F1 / per-class recall for
+# the shipped XGBoost model are intentionally omitted — no file in this
+# project records that exact number for the final combined model (only
+# for a DistilBERT-alone ablation comparison in
+# pipeline/modeling/train_recommendation_classifier.py's own docstring),
+# and inventing or estimating one is exactly what this task forbids.
+_MODEL_EVALUATION_METRICS = [
+    ModelEvaluationMetric(
+        label="Recommendation confidence",
+        value=0.713,
+        description=(
+            "Pearson correlation between the live recommendation confidence and real place "
+            "outcomes. Correlation measures how strongly the score tracks the real outcome, "
+            "not a percentage of correct predictions."
+        ),
+    ),
+    ModelEvaluationMetric(
+        label="Previous quality score",
+        value=0.171,
+        description=(
+            "Pearson correlation for the earlier quality-score approach this replaced, "
+            "evaluated the same way against the same real outcomes."
+        ),
+    ),
+]
+
+
 class StatsResponse(BaseModel):
     """All 5 of app/pages/3_Stats_Dashboard.py's aggregate queries in one
     payload, matching that page's "whole dashboard loads at once" UX rather
     than fragmenting one screen's data across 5 endpoints. Forecast stays in
     long format exactly as SQL returns it — pivoting to wide format for the
-    chart is a frontend concern (web/lib/stats.ts), not this endpoint's."""
+    chart is a frontend concern (web/lib/stats.ts), not this endpoint's.
+    model_evaluation is the one field here that isn't a live SQL
+    aggregate — see ModelEvaluation's own docstring."""
 
     quality_by_neighborhood: list[NeighborhoodQuality]
     quality_by_category: list[CategoryQuality]
     vibe_cluster_sizes: list[VibeClusterSize]
     rated_aspects: list[RatedAspect]
     outdoor_interest_forecast: list[ForecastPoint]
+    model_evaluation: ModelEvaluation
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -345,4 +398,5 @@ def stats():
         vibe_cluster_sizes=vibe_cluster_sizes,
         rated_aspects=rated_aspects,
         outdoor_interest_forecast=outdoor_interest_forecast,
+        model_evaluation=ModelEvaluation(metrics=_MODEL_EVALUATION_METRICS),
     )

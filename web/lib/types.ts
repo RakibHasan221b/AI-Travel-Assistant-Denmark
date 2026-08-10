@@ -76,10 +76,21 @@ export interface ForecastPoint {
   avg_interest: number;
 }
 
+export interface ModelEvaluationMetric {
+  label: string;
+  value: number;
+  description: string;
+}
+
+export interface ModelEvaluation {
+  metrics: ModelEvaluationMetric[];
+}
+
 export interface StatsResponse {
   quality_by_neighborhood: NeighborhoodQuality[];
   quality_by_category: CategoryQuality[];
   vibe_cluster_sizes: VibeClusterSize[];
   rated_aspects: RatedAspect[];
   outdoor_interest_forecast: ForecastPoint[];
+  model_evaluation: ModelEvaluation;
 }

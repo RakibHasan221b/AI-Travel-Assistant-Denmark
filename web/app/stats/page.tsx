@@ -5,6 +5,7 @@ import { QualityByCategoryChart } from "@/components/stats/QualityByCategoryChar
 import { VibeClusterSizesChart } from "@/components/stats/VibeClusterSizesChart";
 import { RatedAspectsChart } from "@/components/stats/RatedAspectsChart";
 import { OutdoorInterestForecastChart } from "@/components/stats/OutdoorInterestForecastChart";
+import { ModelEvaluationSection } from "@/components/stats/ModelEvaluationSection";
 
 export const metadata: Metadata = {
   title: "Stats Dashboard",
@@ -40,6 +41,7 @@ export default async function StatsPage() {
           <QualityByCategoryChart data={stats.quality_by_category} />
           <VibeClusterSizesChart data={stats.vibe_cluster_sizes} />
           <RatedAspectsChart data={stats.rated_aspects} />
+          <ModelEvaluationSection data={stats.model_evaluation} />
         </div>
 
         <div className="mt-4">
