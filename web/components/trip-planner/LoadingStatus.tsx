@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 // (which agent is "probably" running) are kept visually distinct, matching
 // this project's honesty-over-confidence principle elsewhere.
 function stageCopy(elapsedSeconds: number): string {
-  if (elapsedSeconds < 20) return "Place Scout is searching the database for candidates…";
+  if (elapsedSeconds < 20) return "Planning your day…";
   if (elapsedSeconds < 50) return "Concierge is checking weather and pulling place details…";
   return "Concierge is writing your recommendation…";
 }
@@ -33,7 +33,7 @@ export function LoadingStatus({ onCancel }: { onCancel: () => void }) {
         <p className="font-medium">{stageCopy(elapsed)}</p>
       </div>
       <p className="mt-1 text-xs text-ink-faint">
-        Approximate — the agents run one after another; this just estimates where we are.
+        Finding places that match your request and checking the details.
       </p>
 
       <div className="mt-4 flex items-center justify-between">
