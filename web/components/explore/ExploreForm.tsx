@@ -3,6 +3,14 @@
 import { useState } from "react";
 
 const CATEGORIES = ["", "restaurant", "cafe", "hotel", "landmark", "bar"];
+const CATEGORY_LABELS: Record<string, string> = {
+  "": "Any",
+  restaurant: "Restaurant",
+  cafe: "Café",
+  hotel: "Hotel",
+  landmark: "Landmark",
+  bar: "Bar",
+};
 
 export interface ExploreFormValues {
   query: string;
@@ -62,7 +70,7 @@ export function ExploreForm({
         >
           {CATEGORIES.map((c) => (
             <option key={c} value={c}>
-              {c || "Any"}
+              {CATEGORY_LABELS[c]}
             </option>
           ))}
         </select>

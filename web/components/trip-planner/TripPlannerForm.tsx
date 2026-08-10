@@ -60,7 +60,7 @@ export function TripPlannerForm({
       <div className="grid sm:grid-cols-2 gap-5">
         <div>
           <label htmlFor="area" className="block text-sm font-medium mb-1.5">
-            Area in Copenhagen (optional)
+            Area (optional)
           </label>
           <select
             id="area"
@@ -94,7 +94,7 @@ export function TripPlannerForm({
 
       <div>
         <label htmlFor="start-location" className="block text-sm font-medium mb-1.5">
-          Starting from (optional)
+          Starting point (optional)
         </label>
         <input
           id="start-location"
@@ -106,8 +106,7 @@ export function TripPlannerForm({
           className="w-full rounded-sm border border-line bg-surface px-3 py-2.5 text-[15px] outline-none focus:border-accent disabled:opacity-60"
         />
         <p className="mt-1 text-xs text-ink-faint">
-          Used to estimate walking/biking distance to recommended places. Skip it and no travel
-          time will be shown.
+          Add your starting point to see estimated travel distances.
         </p>
       </div>
 
