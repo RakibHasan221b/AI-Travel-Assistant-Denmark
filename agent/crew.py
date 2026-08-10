@@ -97,7 +97,18 @@ _crewai_cache.mark_cache_breakpoint = lambda message: dict(message)
 # Token/cost safeguards (small OpenAI credit balance — keep these
 # conservative, not just "whatever the default happens to be"):
 # - OPENAI_MAX_OUTPUT_TOKENS bounds every single LLM call's output, so one
-#   call can never run away with a huge completion.
+#   call can never run away with a huge completion. 900 was too tight in
+#   practice: verified live that the Concierge's structured JSON answer
+#   (places, written first in TripPlanOutput's field order, then
+#   weather_summary, then overall_note) hit exactly 900 completion_tokens
+#   with a real, multi-place, start_location-given request — cutting off
+#   mid-string in weather_summary ('"weather_summary": "On August 12,
+#   2026, expect a high of 20.', no closing quote). instructor's own
+#   retry-on-invalid-JSON then closed the syntax and completed
+#   overall_note, but never went back to rewrite the now-truncated
+#   weather_summary sentence, so the API response looked "successful"
+#   while silently shipping half a sentence to the frontend. 1500 gives
+#   real headroom above the 900 actually observed being hit.
 # - MAX_LLM_CALLS_PER_REQUEST bounds total LLM calls across BOTH agents for
 #   ONE trip-plan request (enforced in build_crew() below, not just
 #   crewai's own per-agent max_iter) — hitting it raises
@@ -107,7 +118,7 @@ _crewai_cache.mark_cache_breakpoint = lambda message: dict(message)
 #   retry-on-429/5xx behavior, so a single flaky call can't silently turn
 #   into several billed attempts.
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "900"))
+OPENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "1500"))
 MAX_LLM_CALLS_PER_REQUEST = int(os.environ.get("MAX_LLM_CALLS_PER_REQUEST", "6"))
 MAX_AGENT_ITER = 3
 
