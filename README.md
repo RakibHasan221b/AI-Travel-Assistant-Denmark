@@ -12,7 +12,11 @@ solo, entirely on free-tier infrastructure.
 ## What it does
 
 - **Explore** — semantic ("vibe") search over 1,897 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
-- **Trip Planner** — two [CrewAI](https://www.crewai.com/) agents (Intent Analyst, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite. The Intent Analyst turns a free-text request into a validated structured spec (Pydantic + `instructor`); a plain backend function then decides how each part gets searched — near/far/sequential/area — deterministically, so the LLM reasons about intent but never about spatial routing. Each recommended place carries a live `recommendation_confidence` score (XGBoost, computed fresh from real review text on every request, never a stale stored number). A live-lookup fallback (Nominatim, with Serper as a second fallback) honestly flags any place outside the curated dataset instead of pretending it has the same evidence behind it. Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
+- **Trip Planner** — two [CrewAI](https://www.crewai.com/) agents (Intent Analyst, Concierge) plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite.
+  - The Intent Analyst turns free text into a validated structured spec (Pydantic + `instructor`); a plain backend function decides how each part gets searched — near/far/sequential/area — so the LLM reasons about intent but never about spatial routing.
+  - Every recommended place carries a live `recommendation_confidence` score (XGBoost), computed fresh from real review text on every request — never a stale stored number.
+  - A live-lookup fallback (Nominatim, then Serper) honestly flags any place outside the curated dataset instead of pretending it has the same evidence behind it.
+  - Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
 - **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts, plus a Model Evaluation section reporting the recommendation model's real backtested correlation against actual outcomes.
 
 ## Architecture
@@ -81,15 +85,16 @@ frontend on Vercel, calling the API directly from the browser.
 | Weather-aware visit forecast (XGBoost, chronological split) | 97% within ±10 points (RMSE 3.39, R² 0.98) |
 | RAG-summary prompt A/B test | Ran live on real places (20 GPT-4o generations, $0.027 total) with a deterministic scorer — no second LLM call needed to judge the first |
 
-## Real engineering, not just a demo
+## Hardened by real use
 
-This project was built, then actually used — and using it surfaced real bugs
-that got root-caused and fixed with evidence, not guessed at:
+This wasn't verified once and shipped — it was built, then actually used,
+and using it surfaced real problems that got root-caused with evidence and
+fixed at the architecture level, not patched over:
 
-- **Deployment**: hit and fixed 4 separate production failures getting this live on a free-tier host — a Python-version/build-sandbox mismatch, a missing transitive dependency only exposed by a narrower install, an out-of-memory kill traced to one specific import (not the framework everyone would've blamed), and a CI dependency gap.
-- **Data quality**: found live that a famous landmark returned zero search results (rank 701/1,896 at the time) because its only stored text was a bare Danish name — fixed with a web-enrichment pipeline, verified the fix moved it to rank 1.
-- **Data quality, part 2**: every place originally had no neighborhood assigned. Fixed via point-in-polygon matching against real Danish government district boundaries (opendata.dk + DAWA) instead of a slow, rate-limited API — 99.9% matched in 36 seconds.
-- **Agent behavior**: found live that a real intent-classification bug let a sequence word like "then" leak into a spatial-relationship field, causing the agent to search "near" a place that was never actually meant as an anchor — fixed by moving spatial routing out of the LLM entirely into a validated, deterministic backend function.
+- **A real LLM reliability bug became a deterministic-routing redesign.** Live testing found that a bare sequence word like "then" (as in "...and then grab coffee") could get misread as a spatial-relationship marker, sending the agent searching "near" a place that was never meant as an anchor. Rather than patching the prompt again, spatial routing was moved out of the LLM entirely — a validated backend function now decides near/far/sequential/area deterministically, so the model reasons about intent and never about where to search.
+- **Four separate production failures, each root-caused to a specific line, not blamed on the framework.** Getting this live on a free-tier host surfaced a Python-version/build-sandbox mismatch, a missing transitive dependency only exposed by a narrower install, an out-of-memory kill traced to one specific import, and a CI dependency gap.
+- **A famous landmark returned zero search results, in production.** The Little Mermaid statue's only stored text was a bare Danish OSM tag — traced to rank 701 out of 1,896 in semantic search. Fixed with a web-enrichment pipeline; verified the fix moved it to rank 1.
+- **Every place in the database was missing its neighborhood.** `addr:suburb` is rarely set on individual OSM points. Fixed with real point-in-polygon matching against official Danish district boundaries (opendata.dk + DAWA) instead of a slow, rate-limited API — 99.9% matched in 36 seconds.
 
 ## Tech stack
 
