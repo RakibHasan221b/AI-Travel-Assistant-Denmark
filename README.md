@@ -1,10 +1,11 @@
 # AI Denmark Explorer
 
-An AI-powered place-discovery app for Copenhagen that doubles as a
-deliberate showcase of the modern full-stack AI/ML toolkit — SQL,
-embeddings, RAG, multi-agent orchestration, classical ML, a React/Next.js
-frontend, and real deployment engineering — built, deployed, and debugged
-solo, entirely on free-tier infrastructure.
+An AI-powered place-discovery app for Copenhagen — built, deployed, and
+debugged solo, entirely on free-tier infrastructure.
+
+It's also a full-stack AI/ML case study: SQL, embeddings, RAG, multi-agent
+orchestration, classical ML, and a React/Next.js frontend, all shipped
+end to end, not just prototyped.
 
 **[Live app](https://ai-denmark-explorer.vercel.app/)** ·
 **[Live API](https://ai-denmark-explorer-api.onrender.com/health)**
