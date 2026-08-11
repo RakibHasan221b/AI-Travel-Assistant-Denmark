@@ -321,7 +321,7 @@ def test_discover_live_place_persists_and_scores_when_real_evidence_is_found(mon
     # Core requirement B: a new place with fresh review data receives a
     # real ML score computed through the exact same pipeline as any
     # curated place — not an LLM-generated or invented number.
-    import ingestion.web_enrichment as web_enrichment
+    from ingestion import web_enrichment
 
     monkeypatch.setattr(
         web_enrichment, "search_web",
@@ -362,7 +362,7 @@ def test_discover_live_place_persists_nothing_when_no_evidence_is_found(monkeypa
     # Core requirement C: insufficient evidence must not produce a fake
     # score, and must not silently persist a place with nothing behind it.
     import agent.tools as tools_module
-    import ingestion.web_enrichment as web_enrichment
+    from ingestion import web_enrichment
 
     monkeypatch.setattr(web_enrichment, "search_web", lambda q: [])
     monkeypatch.setattr(tools_module, "_wikipedia_summary", lambda name: None)
@@ -400,7 +400,7 @@ def test_discover_live_place_degrades_gracefully_on_a_real_serper_failure(monkey
     # error, rate limit) must degrade to "insufficient evidence," not
     # crash the whole request or fabricate a score.
     import agent.tools as tools_module
-    import ingestion.web_enrichment as web_enrichment
+    from ingestion import web_enrichment
 
     def _raise(*a, **k):
         raise requests.exceptions.Timeout("Serper timed out")
@@ -441,7 +441,7 @@ def test_identical_repeated_tool_calls_reuse_the_cached_result(monkeypatch):
     assert call_count["n"] == 1, "identical repeated call should not re-run the real search"
 
     # A genuinely different call must NOT be served from the same cache entry.
-    third = search_places.run(query="sushi restaurant")
+    search_places.run(query="sushi restaurant")
     assert call_count["n"] == 2
 
 
@@ -459,7 +459,7 @@ def test_searching_the_same_new_place_twice_does_not_create_a_duplicate_row(monk
     # same genuinely-new place twice must reuse the row the first search
     # created, not insert a second one.
     import agent.tools as tools_module
-    import ingestion.web_enrichment as web_enrichment
+    from ingestion import web_enrichment
 
     monkeypatch.setattr(
         web_enrichment, "search_web",

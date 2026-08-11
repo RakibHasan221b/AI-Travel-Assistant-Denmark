@@ -390,7 +390,7 @@ def search_places_near(anchor_place: str, category: str = "", limit: int | str =
         anchor = _resolve_place(cur, anchor_place)
         if not anchor:
             return f"No place found matching '{anchor_place}' to search near."
-        anchor_id, anchor_name, anchor_lat, anchor_lon = anchor
+        _anchor_id, anchor_name, anchor_lat, anchor_lon = anchor
         rows = _places_near(
             cur, anchor_lat, anchor_lon, category=category, exclude_name=anchor_name,
             limit=limit, max_km=radius,

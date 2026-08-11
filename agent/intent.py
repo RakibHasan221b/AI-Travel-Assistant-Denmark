@@ -411,7 +411,7 @@ def _execute_far(cur, conn, part: ItineraryPart, start_coords) -> list[dict]:
     for row in rows:
         lat, lon = row.get("lat"), row.get("lon")
         if anchor is not None and part.min_distance_km is not None and lat is not None and lon is not None:
-            anchor_name, anchor_lat, anchor_lon = anchor
+            _anchor_name, anchor_lat, anchor_lon = anchor
             if haversine_km(anchor_lat, anchor_lon, lat, lon) < part.min_distance_km:
                 continue
         scored = _score_one(cur, conn, row["name"], part, sources.get(row["name"].lower(), "database"))

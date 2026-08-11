@@ -21,7 +21,6 @@ from agent.intent import (
 )
 from agent.tools import set_trip_start
 
-
 # ---------------------------------------------------------------------------
 # ItineraryPart / TripSpecification validation
 # ---------------------------------------------------------------------------
