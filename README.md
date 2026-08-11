@@ -6,12 +6,8 @@ embeddings, RAG, multi-agent orchestration, classical ML, a React/Next.js
 frontend, and real deployment engineering — built, deployed, and debugged
 solo, entirely on free-tier infrastructure.
 
-**[Live app (React/Next.js)](https://ai-denmark-explorer.vercel.app/)** ·
-**[Live app (Streamlit)](https://ai-travel-assistant-dk.streamlit.app/)** ·
+**[Live app](https://ai-denmark-explorer.vercel.app/)** ·
 **[Live API](https://ai-denmark-explorer-api.onrender.com/health)**
-
-Two live frontends, one shared FastAPI/Postgres backend — the React app is
-the actively-developed one; Streamlit stays live alongside it.
 
 ## What it does
 
@@ -44,7 +40,7 @@ that got root-caused and fixed with evidence, not guessed at:
 **ML**: scikit-learn · XGBoost · Optuna · MLflow · sentence-transformers / fastembed · DistilBERT (offline sentiment scoring)
 **LLM / Agents**: GPT-4o · Groq (Llama 3.3 70B) · LangChain · CrewAI · Pydantic + `instructor` (validated structured intent) · Serper (web-search fallback)
 **Backend**: FastAPI (Render)
-**Frontend**: React · Next.js (App Router, Server + Client Components) · TypeScript · Tailwind CSS · Recharts, deployed on Vercel — plus Streamlit (Streamlit Community Cloud)
+**Frontend**: React · Next.js (App Router, Server + Client Components) · TypeScript · Tailwind CSS · Recharts, deployed on Vercel
 **Quality**: pytest · ruff · GitHub Actions CI
 
 See [`docs/technique_map.md`](docs/technique_map.md) for the full technique-to-implementation mapping.
@@ -65,7 +61,7 @@ See [`docs/technique_map.md`](docs/technique_map.md) for the full technique-to-i
 | 9 | Quality-score model bake-off | done — XGBoost won (RMSE 8.76, R² 0.12, 83% within ±10pts) vs RF/Linear/NN, Optuna-tuned, MLflow-tracked, scores stored for all 1,896 places |
 | 10 | Weather-aware time series | done — real Open-Meteo weather + confirmed Copenhagen event dates, chronological split (RMSE 3.39, R² 0.98, 97% within ±10pts), 5,688 place-day forecasts |
 | 11 | CrewAI trip-planning crew + API | done — Intent Analyst / Concierge (Groq llama-3.3-70b), structured intent extraction with deterministic near/far/sequential/area search routing, thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
-| 12 | Deployment | **live** — API on Render, app on Streamlit Community Cloud. See `docs/deployment_troubleshooting.md` for the real debugging story |
+| 12 | Deployment | **live** — API on Render, frontend on Vercel. See `docs/deployment_troubleshooting.md` for the real debugging story |
 | 13 | Portfolio write-up | this README, plus a CV/LinkedIn version |
 | 14 | React/Next.js/TypeScript frontend | **live** — all three pages (Explore, Trip Planner, Stats Dashboard) rebuilt in Next.js (App Router, TypeScript, Tailwind, Recharts), deployed on Vercel, calling the same FastAPI backend directly from the browser |
 
