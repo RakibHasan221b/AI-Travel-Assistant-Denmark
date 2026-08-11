@@ -11,7 +11,7 @@ solo, entirely on free-tier infrastructure.
 
 ## What it does
 
-- **Explore** — semantic ("vibe") search over 1,896 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
+- **Explore** — semantic ("vibe") search over 1,897 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
 - **Trip Planner** — two [CrewAI](https://www.crewai.com/) agents (Intent Analyst, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite. The Intent Analyst turns a free-text request into a validated structured spec (Pydantic + `instructor`); a plain backend function then decides how each part gets searched — near/far/sequential/area — deterministically, so the LLM reasons about intent but never about spatial routing. Each recommended place carries a live `recommendation_confidence` score (XGBoost, computed fresh from real review text on every request, never a stale stored number). A live-lookup fallback (Nominatim, with Serper as a second fallback) honestly flags any place outside the curated dataset instead of pretending it has the same evidence behind it. Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
 - **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts, plus a Model Evaluation section reporting the recommendation model's real backtested correlation against actual outcomes.
 
@@ -50,15 +50,15 @@ See [`docs/technique_map.md`](docs/technique_map.md) for the full technique-to-i
 | Phase | What | Status |
 |---|---|---|
 | 0 | Setup | done |
-| 1 | OSM place data backbone | done — 1,896 places loaded |
+| 1 | OSM place data backbone | done — 1,897 places loaded |
 | 2 | ~~Seed reviews~~ | dropped, not required |
 | 3 | Wikivoyage descriptions | done — 553 parsed, linked to places |
 | 4 | Reddit signal pipeline (optional) | tabled — Reddit now requires Devvit developer registration + pre-approval, not just a quick form; revisit later, never blocking |
 | 5 | ML→LLM→ML distillation loop | not started |
-| 6 | pgvector semantic search | done — 1,896 places embedded, verified with combined category+neighborhood+semantic queries |
+| 6 | pgvector semantic search | done — 1,897 places embedded, verified with combined category+neighborhood+semantic queries |
 | 7 | Unsupervised clustering | done — 8 named clusters (silhouette-picked k), e.g. "Sushi Restaurants," "Cozy Cafes" |
 | 8 | RAG-grounded summaries | done — 177 places summarized via pgvector retrieval + GPT-4o (LangChain), sources cited per summary |
-| 9 | Quality-score model bake-off | done — XGBoost won (RMSE 8.76, R² 0.12, 83% within ±10pts) vs RF/Linear/NN, Optuna-tuned, MLflow-tracked, scores stored for all 1,896 places |
+| 9 | Quality-score model bake-off | done — XGBoost won (RMSE 8.76, R² 0.12, 83% within ±10pts) vs RF/Linear/NN, Optuna-tuned, MLflow-tracked, scores stored for all 1,897 places |
 | 10 | Weather-aware time series | done — real Open-Meteo weather + confirmed Copenhagen event dates, chronological split (RMSE 3.39, R² 0.98, 97% within ±10pts), 5,688 place-day forecasts |
 | 11 | CrewAI trip-planning crew + API | done — Intent Analyst / Concierge (Groq llama-3.3-70b), structured intent extraction with deterministic near/far/sequential/area search routing, thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
 | 12 | Deployment | **live** — API on Render, frontend on Vercel. See `docs/deployment_troubleshooting.md` for the real debugging story |
