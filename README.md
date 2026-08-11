@@ -17,6 +17,8 @@ solo, entirely on free-tier infrastructure.
 
 ## Architecture
 
+![AI Denmark Explorer architecture diagram](docs/images/architecture.png)
+
 One request pipeline, six steps: a natural-language request becomes a
 validated structured intent, gets routed and searched deterministically,
 ranked by a real ML model, and answered with a grounded response. The LLM
