@@ -97,12 +97,37 @@ that got root-caused and fixed with evidence, not guessed at:
 
 ## Tech stack
 
-**Data**: PostgreSQL (Neon) · pgvector · OpenStreetMap · Wikivoyage · Open-Meteo · opendata.dk / DAWA
-**ML**: scikit-learn · XGBoost · Optuna · MLflow · sentence-transformers / fastembed · DistilBERT (offline sentiment scoring)
-**LLM / Agents**: GPT-4o · GPT-4o-mini · LangChain · CrewAI · Pydantic + `instructor` (validated structured intent) · Serper (web-search fallback)
-**Backend**: FastAPI (Render)
-**Frontend**: React · Next.js (App Router, Server + Client Components) · TypeScript · Tailwind CSS · Recharts, deployed on Vercel
-**Quality**: pytest · ruff · GitHub Actions CI
+| Tool | Category | What it does here |
+|---|---|---|
+| PostgreSQL (Neon) | Data | Primary database, scale-to-zero free tier |
+| pgvector | Data | Vector similarity search, in the same SQL query as structured filters |
+| OpenStreetMap | Data | Source of every real place record (1,897 and counting) |
+| osmium | Data | Bulk OSM extraction for the initial load |
+| Nominatim | Data | Live geocoding and single-place lookup |
+| Wikivoyage / Wikipedia | Data | Place descriptions |
+| opendata.dk / DAWA | Data | Official Danish district boundaries for neighborhood matching |
+| Shapely | Data | Point-in-polygon neighborhood matching against those boundaries |
+| Serper | Data / Agents | Web-search fallback for thin-data places, independently re-verified before trusting |
+| scikit-learn | ML | Unsupervised clustering, cross-validation |
+| XGBoost | ML | Quality-score and recommendation-confidence classifiers |
+| Optuna | ML | Hyperparameter tuning |
+| MLflow | ML | Experiment tracking |
+| sentence-transformers / fastembed | ML | `all-MiniLM-L6-v2` embeddings, semantic search + recommendation signal |
+| DistilBERT | ML | Offline sentiment scoring (`transformers`), feeds the recommendation classifier |
+| GPT-4o | Agents | Concierge narration and RAG-summary generation |
+| GPT-4o-mini | Agents | Intent Analyst's structured-intent extraction |
+| CrewAI | Agents | Multi-agent orchestration (Intent Analyst, Concierge) |
+| Pydantic + `instructor` | Agents | Validated structured-intent extraction from free text |
+| LangChain | Agents | RAG retrieval chain behind Explore's cited place summaries |
+| Open-Meteo | Live services | Real weather for the actual requested date, archive + forecast |
+| FastAPI | Backend | API framework, deployed on Render |
+| React / Next.js | Frontend | App Router, Server + Client Components, deployed on Vercel |
+| TypeScript | Frontend | Type safety across the frontend |
+| Tailwind CSS | Frontend | Styling |
+| Recharts | Frontend | Stats Dashboard charts |
+| pytest | Quality | 136 automated tests |
+| ruff | Quality | Linting |
+| GitHub Actions | Quality | CI on every push |
 
 ## Setup
 
