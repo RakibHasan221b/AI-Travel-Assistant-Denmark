@@ -72,10 +72,6 @@ frontend on Vercel, calling the API directly from the browser.
 
 **Quality.** 136 automated tests, GitHub Actions CI, `ruff` linting.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full technical
-write-up and [`docs/technique_map.md`](docs/technique_map.md) for the
-complete technique-to-implementation mapping.
-
 ## Key results
 
 | Model | Result |
@@ -90,7 +86,7 @@ complete technique-to-implementation mapping.
 This project was built, then actually used — and using it surfaced real bugs
 that got root-caused and fixed with evidence, not guessed at:
 
-- **Deployment**: hit and fixed 4 separate production failures getting this live on a free-tier host — a Python-version/build-sandbox mismatch, a missing transitive dependency only exposed by a narrower install, an out-of-memory kill traced to one specific import (not the framework everyone would've blamed), and a CI dependency gap. Full root-cause log: [`docs/deployment_troubleshooting.md`](docs/deployment_troubleshooting.md).
+- **Deployment**: hit and fixed 4 separate production failures getting this live on a free-tier host — a Python-version/build-sandbox mismatch, a missing transitive dependency only exposed by a narrower install, an out-of-memory kill traced to one specific import (not the framework everyone would've blamed), and a CI dependency gap.
 - **Data quality**: found live that a famous landmark returned zero search results (rank 701/1,896 at the time) because its only stored text was a bare Danish name — fixed with a web-enrichment pipeline, verified the fix moved it to rank 1.
 - **Data quality, part 2**: every place originally had no neighborhood assigned. Fixed via point-in-polygon matching against real Danish government district boundaries (opendata.dk + DAWA) instead of a slow, rate-limited API — 99.9% matched in 36 seconds.
 - **Agent behavior**: found live that a real intent-classification bug let a sequence word like "then" leak into a spatial-relationship field, causing the agent to search "near" a place that was never actually meant as an anchor — fixed by moving spatial routing out of the LLM entirely into a validated, deterministic backend function.
