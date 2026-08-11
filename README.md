@@ -6,9 +6,9 @@ embeddings, RAG, multi-agent orchestration, classical ML, a React/Next.js
 frontend, and real deployment engineering — built, deployed, and debugged
 solo, entirely on free-tier infrastructure.
 
-**[🔴 Live app (React/Next.js)](https://ai-denmark-explorer.vercel.app/)** ·
-**[🔴 Live app (Streamlit)](https://ai-travel-assistant-dk.streamlit.app/)** ·
-**[⚙️ Live API](https://ai-denmark-explorer-api.onrender.com/health)**
+**[Live app (React/Next.js)](https://ai-denmark-explorer.vercel.app/)** ·
+**[Live app (Streamlit)](https://ai-travel-assistant-dk.streamlit.app/)** ·
+**[Live API](https://ai-denmark-explorer-api.onrender.com/health)**
 
 Two live frontends, one shared FastAPI/Postgres backend — the React app is
 the actively-developed one; Streamlit stays live alongside it.
@@ -16,14 +16,15 @@ the actively-developed one; Streamlit stays live alongside it.
 ## What it does
 
 - **Explore** — semantic ("vibe") search over 1,896 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
-- **Trip Planner** — two [CrewAI](https://www.crewai.com/) agents (Place Scout, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite. A live-lookup fallback (Nominatim) honestly flags any place outside the curated, scored dataset instead of pretending it has the same evidence behind it. Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
-- **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts.
+- **Trip Planner** — two [CrewAI](https://www.crewai.com/) agents (Intent Analyst, Concierge) collaborate live to plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite. The Intent Analyst turns a free-text request into a validated structured spec (Pydantic + `instructor`); a plain backend function then decides how each part gets searched — near/far/sequential/area — deterministically, so the LLM reasons about intent but never about spatial routing. Each recommended place carries a live `recommendation_confidence` score (XGBoost, computed fresh from real review text on every request, never a stale stored number). A live-lookup fallback (Nominatim, with Serper as a second fallback) honestly flags any place outside the curated dataset instead of pretending it has the same evidence behind it. Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
+- **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts, plus a Model Evaluation section reporting the recommendation model's real backtested correlation against actual outcomes.
 
 ## Key results
 
 | Model | Result |
 |---|---|
-| Quality-score prediction (XGBoost, Optuna-tuned) | 83% of predictions within ±10 points of the true score (RMSE 8.76, R² 0.12 on 172 labeled examples — honestly reported, not inflated) |
+| Recommendation confidence (XGBoost classifier, live per-request) | Powers the Trip Planner. Backtested against real outcomes: Pearson r = 0.713, vs r = 0.171 for the quality-score model it replaced in that path — same evaluation methodology, run on the same real places |
+| Quality-score prediction (XGBoost, Optuna-tuned) | Still powers Explore's ranking. 83% of predictions within ±10 points of the true score (RMSE 8.76, R² 0.12 on 172 labeled examples — honestly reported, not inflated) |
 | Weather-aware visit forecast (XGBoost, chronological split) | 97% within ±10 points (RMSE 3.39, R² 0.98) |
 | RAG-summary prompt A/B test | Ran live on real places (20 GPT-4o generations, $0.027 total) with a deterministic scorer — no second LLM call needed to judge the first |
 
@@ -40,8 +41,8 @@ that got root-caused and fixed with evidence, not guessed at:
 ## Tech stack
 
 **Data**: PostgreSQL (Neon) · pgvector · OpenStreetMap · Wikivoyage · Open-Meteo · opendata.dk / DAWA
-**ML**: scikit-learn · XGBoost · Optuna · MLflow · sentence-transformers / fastembed
-**LLM / Agents**: GPT-4o · Groq (Llama 3.3 70B) · LangChain · CrewAI
+**ML**: scikit-learn · XGBoost · Optuna · MLflow · sentence-transformers / fastembed · DistilBERT (offline sentiment scoring)
+**LLM / Agents**: GPT-4o · Groq (Llama 3.3 70B) · LangChain · CrewAI · Pydantic + `instructor` (validated structured intent) · Serper (web-search fallback)
 **Backend**: FastAPI (Render)
 **Frontend**: React · Next.js (App Router, Server + Client Components) · TypeScript · Tailwind CSS · Recharts, deployed on Vercel — plus Streamlit (Streamlit Community Cloud)
 **Quality**: pytest · ruff · GitHub Actions CI
@@ -63,7 +64,7 @@ See [`docs/technique_map.md`](docs/technique_map.md) for the full technique-to-i
 | 8 | RAG-grounded summaries | done — 177 places summarized via pgvector retrieval + GPT-4o (LangChain), sources cited per summary |
 | 9 | Quality-score model bake-off | done — XGBoost won (RMSE 8.76, R² 0.12, 83% within ±10pts) vs RF/Linear/NN, Optuna-tuned, MLflow-tracked, scores stored for all 1,896 places |
 | 10 | Weather-aware time series | done — real Open-Meteo weather + confirmed Copenhagen event dates, chronological split (RMSE 3.39, R² 0.98, 97% within ±10pts), 5,688 place-day forecasts |
-| 11 | CrewAI trip-planning crew + API | done — Place Scout / Concierge (Groq llama-3.3-70b), thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
+| 11 | CrewAI trip-planning crew + API | done — Intent Analyst / Concierge (Groq llama-3.3-70b), structured intent extraction with deterministic near/far/sequential/area search routing, thin FastAPI `/trip-plan`, verified live end-to-end via HTTP |
 | 12 | Deployment | **live** — API on Render, app on Streamlit Community Cloud. See `docs/deployment_troubleshooting.md` for the real debugging story |
 | 13 | Portfolio write-up | this README, plus a CV/LinkedIn version |
 | 14 | React/Next.js/TypeScript frontend | **live** — all three pages (Explore, Trip Planner, Stats Dashboard) rebuilt in Next.js (App Router, TypeScript, Tailwind, Recharts), deployed on Vercel, calling the same FastAPI backend directly from the browser |
@@ -73,8 +74,16 @@ validation on OSM ingestion, an A/B-testing framework for RAG-summary
 prompts, web-search enrichment for thin-data places, point-in-polygon
 neighborhood backfill, a Trip Planner starting-location + travel-time
 feature, a live-lookup fallback tool for places outside the curated dataset,
-and a database-backed cache that serves repeat Trip Planner requests at zero
-LLM cost. See [`docs/technique_map.md`](docs/technique_map.md) for full details on each.
+a database-backed cache that serves repeat Trip Planner requests at zero
+LLM cost, a redesign from a stored quality score to a live `recommendation_confidence`
+model (DistilBERT sentiment, relocated offline after a real Render memory
+measurement showed the live path wouldn't fit the free tier) backtested at
+r=0.713 vs the old model's r=0.171, a structured-intent architecture (Pydantic
++ `instructor`) that replaced prompt-based near/far reasoning with
+deterministic backend routing, and a Model Evaluation section on the Stats
+Dashboard exposing that backtest directly. 136 automated tests, GitHub
+Actions CI. See [`docs/technique_map.md`](docs/technique_map.md) for full
+details on each.
 
 ## Setup
 
