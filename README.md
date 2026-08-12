@@ -1,6 +1,6 @@
 # AI Denmark Explorer
 
-An AI-powered place-discovery app for Copenhagen — built, deployed, and
+An AI-powered place-discovery app for Copenhagen, built, deployed, and
 debugged solo, entirely on free-tier infrastructure.
 
 It's also a full-stack AI/ML case study: SQL, embeddings, RAG, multi-agent
@@ -12,13 +12,13 @@ end to end, not just prototyped.
 
 ## What it does
 
-- **Explore** — semantic ("vibe") search over 1,897 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
-- **Trip Planner** — two [CrewAI](https://www.crewai.com/) agents (Intent Analyst, Concierge) plan a real, honest trip recommendation, grounded in real weather and real place data — never inventing a fact it can't cite.
-  - The Intent Analyst turns free text into a validated structured spec (Pydantic + `instructor`); a plain backend function decides how each part gets searched — near/far/sequential/area — so the LLM reasons about intent but never about spatial routing.
-  - Every recommended place carries a live `recommendation_confidence` score (XGBoost), computed fresh from real review text on every request — never a stale stored number.
+- **Explore**: semantic ("vibe") search over 1,897 real Copenhagen places (restaurants, cafes, hotels, landmarks), each with a predicted quality score, a named vibe cluster, and an AI-grounded summary with cited sources.
+- **Trip Planner**: two [CrewAI](https://www.crewai.com/) agents (Intent Analyst, Concierge) plan a real, honest trip recommendation, grounded in real weather and real place data, never inventing a fact it can't cite.
+  - The Intent Analyst turns free text into a validated structured spec (Pydantic + `instructor`); a plain backend function decides how each part gets searched (near/far/sequential/area), so the LLM reasons about intent but never about spatial routing.
+  - Every recommended place carries a live `recommendation_confidence` score (XGBoost), computed fresh from real review text on every request, never a stale stored number.
   - A live-lookup fallback (Nominatim, then Serper) honestly flags any place outside the curated dataset instead of pretending it has the same evidence behind it.
   - Repeat and near-repeat requests are served from a database-backed cache instead of re-running the agents.
-- **Stats Dashboard** — real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts, plus a Model Evaluation section reporting the recommendation model's real backtested correlation against actual outcomes.
+- **Stats Dashboard**: real aggregate SQL analytics (`GROUP BY`/`FILTER`), computed live from Postgres on every request (not pre-baked at build time), rendered as charts, plus a Model Evaluation section reporting the recommendation model's real backtested correlation against actual outcomes.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ end to end, not just prototyped.
 One request pipeline, six steps: a natural-language request becomes a
 validated structured intent, gets routed and searched deterministically,
 ranked by a real ML model, and answered with a grounded response. The LLM
-reasons about what the traveler means — never about where to search or
+reasons about what the traveler means, never about where to search or
 what's true.
 
 **Request flow**: Natural Language Request → Structured Intent → Validated
@@ -46,21 +46,21 @@ slow, rate-limited geocoding API.
 stores every place and its embedding (`all-MiniLM-L6-v2`). Semantic search
 retrieves by meaning, then a reranking layer combines that similarity with
 real lexical name-matching so an exact-name query doesn't get buried under
-topically-similar decoys. Spatial relationships — near an anchor, far from
-it, a sequence, a neighborhood constraint — are resolved by explicit
+topically-similar decoys. Spatial relationships (near an anchor, far from
+it, a sequence, a neighborhood constraint) are resolved by explicit
 backend routing, never inferred by the LLM.
 
 **Machine learning.** A `recommendation_confidence` score is computed live
 for every recommended place: DistilBERT's offline-precomputed sentiment
 reading and a freshly-computed MiniLM semantic-nuance signal both feed a
 trained XGBoost classifier. Backtested against real outcomes at Pearson
-r = 0.713 — more than 4x the correlation of the quality-score model it
+r = 0.713, more than 4x the correlation of the quality-score model it
 replaced in this path (r = 0.171). Optuna tunes hyperparameters; a
 separate, Explore-only XGBoost model still handles the original
 quality-score ranking task.
 
 **Generative AI.** Two CrewAI agents. The Intent Analyst (OpenAI
-`gpt-4o-mini`) turns free text into a validated structured spec — it has
+`gpt-4o-mini`) turns free text into a validated structured spec; it has
 no database tools at all. The Concierge (OpenAI `gpt-4o`) narrates the
 final answer from real retrieved data, with an explicit guard against
 claiming proximity or facts the pipeline didn't actually establish.
@@ -81,22 +81,22 @@ frontend on Vercel, calling the API directly from the browser.
 
 | Model | Result |
 |---|---|
-| Recommendation confidence (XGBoost classifier, live per-request) | Powers the Trip Planner. Backtested against real outcomes: Pearson r = 0.713, vs r = 0.171 for the quality-score model it replaced in that path — same evaluation methodology, run on the same real places |
-| Quality-score prediction (XGBoost, Optuna-tuned) | Still powers Explore's ranking. 83% of predictions within ±10 points of the true score (RMSE 8.76, R² 0.12 on 172 labeled examples — honestly reported, not inflated) |
+| Recommendation confidence (XGBoost classifier, live per-request) | Powers the Trip Planner. Backtested against real outcomes: Pearson r = 0.713, vs r = 0.171 for the quality-score model it replaced in that path (same evaluation methodology, run on the same real places) |
+| Quality-score prediction (XGBoost, Optuna-tuned) | Still powers Explore's ranking. 83% of predictions within ±10 points of the true score (RMSE 8.76, R² 0.12 on 172 labeled examples, honestly reported, not inflated) |
 | Weather-aware visit forecast (XGBoost, chronological split) | 97% within ±10 points (RMSE 3.39, R² 0.98) |
-| RAG-summary prompt A/B test | Ran live on real places (20 GPT-4o generations, $0.027 total) with a deterministic scorer — no second LLM call needed to judge the first |
+| RAG-summary prompt A/B test | Ran live on real places (20 GPT-4o generations, $0.027 total) with a deterministic scorer; no second LLM call needed to judge the first |
 
 ## Hardened by real use
 
-This wasn't verified once and shipped — it was built, then actually used,
+This wasn't verified once and shipped; it was built, then actually used,
 and using it surfaced real problems that got root-caused with evidence and
 fixed at the architecture level, not patched over:
 
-- **A real LLM reliability bug became a deterministic-routing redesign.** Live testing found that a bare sequence word like "then" (as in "...and then grab coffee") could get misread as a spatial-relationship marker, sending the agent searching "near" a place that was never meant as an anchor. Rather than patching the prompt again, spatial routing was moved out of the LLM entirely — a validated backend function now decides near/far/sequential/area deterministically, so the model reasons about intent and never about where to search.
-- **Even that deterministic "near" search had a real relevance bug.** Asking for "a sushi place near the Little Mermaid" silently returned the closest restaurant of any kind, Italian included, because `near` ranked candidates by distance alone and nothing ever read what was actually being asked for. Rather than hardcoding a cuisine list — which can never cover what a user might type next — the fix reused the same semantic-relevance ranking Explore already had: the traveler's own wording is now scored against every nearby candidate, and if genuinely nothing matches, the app says so honestly and falls back to a live search instead of quietly substituting something else. Verified with 8 new regression tests and real before/after checks against the live database.
+- **A real LLM reliability bug became a deterministic-routing redesign.** Live testing found that a bare sequence word like "then" (as in "...and then grab coffee") could get misread as a spatial-relationship marker, sending the agent searching "near" a place that was never meant as an anchor. Rather than patching the prompt again, spatial routing was moved out of the LLM entirely: a validated backend function now decides near/far/sequential/area deterministically, so the model reasons about intent and never about where to search.
+- **Even that deterministic "near" search had a real relevance bug.** Asking for "a sushi place near the Little Mermaid" silently returned the closest restaurant of any kind, Italian included, because `near` ranked candidates by distance alone and nothing ever read what was actually being asked for. Rather than hardcoding a cuisine list, which can never cover what a user might type next, the fix reused the same semantic-relevance ranking Explore already had: the traveler's own wording is now scored against every nearby candidate, and if genuinely nothing matches, the app says so honestly and falls back to a live search instead of quietly substituting something else. Verified with 8 new regression tests and real before/after checks against the live database.
 - **Four separate production failures, each root-caused to a specific line, not blamed on the framework.** Getting this live on a free-tier host surfaced a Python-version/build-sandbox mismatch, a missing transitive dependency only exposed by a narrower install, an out-of-memory kill traced to one specific import, and a CI dependency gap.
-- **A famous landmark returned zero search results, in production.** The Little Mermaid statue's only stored text was a bare Danish OSM tag — traced to rank 701 out of 1,896 in semantic search. Fixed with a web-enrichment pipeline; verified the fix moved it to rank 1.
-- **Every place in the database was missing its neighborhood.** `addr:suburb` is rarely set on individual OSM points. Fixed with real point-in-polygon matching against official Danish district boundaries (opendata.dk + DAWA) instead of a slow, rate-limited API — 99.9% matched in 36 seconds.
+- **A famous landmark returned zero search results, in production.** The Little Mermaid statue's only stored text was a bare Danish OSM tag, traced to rank 701 out of 1,896 in semantic search. Fixed with a web-enrichment pipeline; verified the fix moved it to rank 1.
+- **Every place in the database was missing its neighborhood.** `addr:suburb` is rarely set on individual OSM points. Fixed with real point-in-polygon matching against official Danish district boundaries (opendata.dk + DAWA) instead of a slow, rate-limited API; 99.9% matched in 36 seconds.
 
 ## Tech stack
 
@@ -146,7 +146,7 @@ pytest
 ### The `agent` extra: use a short-path venv on Windows
 
 `pip install -e ".[dev,embeddings,rag,agent]"` pulls in `crewai`, which
-depends on `torch` — and torch's own bundled license files are nested deep
+depends on `torch`, and torch's own bundled license files are nested deep
 enough that combined with a long project path (e.g.
 `...\deeply\nested\parent\folder\ai-denmark-explorer\.venv\...`), the
 install can hit Windows' 260-character path limit. If that happens, create
@@ -159,7 +159,7 @@ C:\Users\<you>\.venvs\ade\Scripts\python.exe -m pip install -e ".[dev,embeddings
 ```
 
 Also install this extra in its own venv, not one shared with other
-projects — `crewai` requires `langchain-core>=1.0`, which conflicts with the
+projects; `crewai` requires `langchain-core>=1.0`, which conflicts with the
 `langchain 0.3.x` pin used elsewhere on the same machine.
 
 Run the API: `uvicorn api.main:app --port 8000`, then
