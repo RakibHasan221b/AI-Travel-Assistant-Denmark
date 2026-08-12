@@ -349,6 +349,7 @@ def _execute_near(cur, conn, part: ItineraryPart, start_coords) -> list[dict]:
     rows = _places_near(
         cur, anchor_lat, anchor_lon, category=part.category or "",
         exclude_name=anchor_name, limit=3, max_km=part.max_distance_km,
+        query=part.query,
     )
     sources = {r["name"].lower(): "database" for r in rows}
 

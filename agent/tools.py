@@ -331,24 +331,53 @@ def search_places(query: str, category: str = "", neighborhood: str = "", limit:
 
 def _places_near(
     cur, lat: float, lon: float, category: str = "", exclude_name: str | None = None,
-    limit: int = 3, max_km: float | None = None,
+    limit: int = 3, max_km: float | None = None, query: str = "",
 ) -> list[dict]:
-    """Real places within max_km (default MAX_NEARBY_KM) of (lat, lon),
-    sorted by actual haversine distance — the shared core of
-    search_places_near() below, factored out so agent/crew.py's
-    deterministic_trip_plan() AND its post-crew near-relationship
-    reconciliation (_reconcile_near_relationships) can both rank "near X"
-    candidates by real geographic distance FROM A NAMED PLACE (never from
-    the traveler's own start_location, and never by semantic similarity)
-    without going through the @tool/LLM-calling layer.
+    """Real places within max_km (default MAX_NEARBY_KM) of (lat, lon) —
+    the shared core of search_places_near() below, factored out so
+    agent/crew.py's deterministic_trip_plan() AND its post-crew near-
+    relationship reconciliation (_reconcile_near_relationships) can both
+    rank "near X" candidates by real geographic distance FROM A NAMED
+    PLACE (never from the traveler's own start_location) without going
+    through the @tool/LLM-calling layer. The distance radius itself is
+    ALWAYS a hard geographic cutoff — that never changes, regardless of
+    the query argument below.
 
     max_km lets a caller tighten the radius (e.g. a traveler who said
     "within 1 km" or "walking distance") — always capped at MAX_NEARBY_KM
     even if a caller asks for more, since that ceiling is itself a real
-    honesty rule (see MAX_NEARBY_KM's own comment), not just a default."""
+    honesty rule (see MAX_NEARBY_KM's own comment), not just a default.
+
+    query (optional): the traveler's own free-text wording for what they
+    actually want at this stop (e.g. "sushi"), as distinct from category
+    (the coarse restaurant/cafe/hotel/landmark/bar structural type). Real
+    bug this fixes: a request like "sushi near the Little Mermaid" was
+    correctly parsed into category="restaurant", query="sushi" by the
+    Intent Analyst, but this function only ever used category+distance —
+    "sushi" itself was silently never checked, so the CLOSEST restaurant
+    (Italian, cafe-vibe, whatever) won regardless of what the traveler
+    asked for. When query is given, candidates within the (unchanged)
+    radius are reranked using the exact same rank_explore_candidates()
+    combined semantic+lexical+category scoring /explore already relies
+    on — including its real relevance floor, so a place that's merely
+    closest but doesn't actually match the query is never silently
+    returned as if it does (this may return fewer than limit, even zero,
+    same as rank_explore_candidates always has — an honest "nothing
+    close enough matched" beats a confident wrong answer). Omitted or
+    empty (every existing caller before this fix): behavior is completely
+    unchanged, pure distance ranking, not one row reordered."""
     radius = MAX_NEARBY_KM if max_km is None else min(max_km, MAX_NEARBY_KM)
-    sql = "SELECT name, category, neighborhood, opening_hours, lat, lon FROM places WHERE lat IS NOT NULL AND lon IS NOT NULL"
     params: dict = {}
+    select_extra = ""
+    if query:
+        model = get_embed_model()
+        query_embedding = next(model.embed([query]))
+        select_extra = ", subcategory, 1 - (embedding <=> %(qvec)s) AS similarity"
+        params["qvec"] = query_embedding
+    sql = (
+        f"SELECT name, category{select_extra}, neighborhood, opening_hours, lat, lon "
+        "FROM places WHERE lat IS NOT NULL AND lon IS NOT NULL"
+    )
     if exclude_name:
         sql += " AND lower(name) != lower(%(exclude_name)s)"
         params["exclude_name"] = exclude_name
@@ -362,7 +391,13 @@ def _places_near(
     for r in rows:
         r["distance_km"] = haversine_km(lat, lon, r["lat"], r["lon"])
     rows.sort(key=lambda r: r["distance_km"])
-    return [r for r in rows if r["distance_km"] <= radius][:limit]
+    within_radius = [r for r in rows if r["distance_km"] <= radius]
+
+    if not query:
+        return within_radius[:limit]
+
+    from api.ranking import rank_explore_candidates
+    return rank_explore_candidates(query, within_radius, final_limit=limit)
 
 
 @tool

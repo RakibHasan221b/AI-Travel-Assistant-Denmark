@@ -362,4 +362,193 @@ def test_execute_near_with_unresolvable_anchor_degrades_to_open_ended_with_a_not
     results = execute_trip_specification(spec)
     for r in results:
         assert r.get("execution_note") is not None
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: near-search must actually use the traveler's query
+# (cuisine/vibe), not just category + distance. Real bug this guards:
+# "sushi near the Little Mermaid" was returning the CLOSEST restaurant
+# (Italian, cafe-vibe, whatever) because _places_near only ever ranked by
+# distance, silently dropping the word "sushi" entirely — see
+# _places_near's own docstring in agent/tools.py for the full story.
+# Every assertion here is checked against real database content actually
+# queried during test-writing, not assumed.
+# ---------------------------------------------------------------------------
+
+
+def test_near_search_matches_sushi_not_just_the_closest_restaurant():
+    set_trip_start(None, None, "")
+    spec = TripSpecification(parts=[
+        ItineraryPart(sequence_index=0, query="Den lille Havfrue", named_place=True, relation=Relation.PRIMARY),
+        ItineraryPart(
+            sequence_index=1, query="sushi", named_place=False, category="restaurant",
+            relation=Relation.NEAR, anchor_query="Den lille Havfrue",
+        ),
+    ])
+    results = execute_trip_specification(spec)
+    near_results = [r for r in results if r["relation"] == "near"]
+    assert len(near_results) >= 1
+    # Real DB content, verified while writing this test: every genuinely
+    # nearby sushi place has "sushi" in its own name (Sticks'n'Sushi,
+    # Kanagawa Sushi, Sushi Nord, Iki Sushi). The old distance-only
+    # behavior returned Nonna regina (Italian) as the #1 result instead.
+    assert any("sushi" in r["name"].lower() for r in near_results)
+    assert all(r["near_place"] == "Den lille Havfrue" for r in near_results)
+    assert all(r["near_distance_km"] <= 2.0 for r in near_results)  # MAX_NEARBY_KM, unchanged
+
+
+def test_near_search_matches_italian_food_near_nyhavn():
+    set_trip_start(None, None, "")
+    spec = TripSpecification(parts=[
+        ItineraryPart(sequence_index=0, query="Nyhavn", named_place=True, relation=Relation.PRIMARY),
+        ItineraryPart(
+            sequence_index=1, query="Italian food", named_place=False, category="restaurant",
+            relation=Relation.NEAR, anchor_query="Nyhavn",
+        ),
+    ])
+    results = execute_trip_specification(spec)
+    near_results = [r for r in results if r["relation"] == "near"]
+    assert len(near_results) >= 1
+    # Real DB content: Italiano, Sole D Italia, Trattoria Italiana, The
+    # Market Italian all resolve here — genuinely Italian by name.
+    assert any(
+        any(tok in r["name"].lower() for tok in ("italia", "trattoria"))
+        for r in near_results
+    )
+
+
+def test_near_search_matches_burgers_near_tivoli():
+    set_trip_start(None, None, "")
+    spec = TripSpecification(parts=[
+        ItineraryPart(sequence_index=0, query="Tivoli", named_place=True, relation=Relation.PRIMARY),
+        ItineraryPart(
+            sequence_index=1, query="burgers", named_place=False, category="restaurant",
+            relation=Relation.NEAR, anchor_query="Tivoli",
+        ),
+    ])
+    results = execute_trip_specification(spec)
+    near_results = [r for r in results if r["relation"] == "near"]
+    assert len(near_results) >= 1
+    # Real DB content: Kristinedal Burgers, Cocks & Cows, Fatty's,
+    # Dandelion Burger all resolve here.
+    assert any("burger" in r["name"].lower() for r in near_results)
+
+
+def test_near_search_still_works_for_a_plain_category_request_coffee_nearby():
+    # Regression guard: the fix must not break the already-working,
+    # simpler case where category alone (no distinctive cuisine word)
+    # is enough - "coffee" near the Little Mermaid should still return
+    # real, near, cafe-appropriate results exactly as it always did.
+    set_trip_start(None, None, "")
+    spec = TripSpecification(parts=[
+        ItineraryPart(sequence_index=0, query="Den lille Havfrue", named_place=True, relation=Relation.PRIMARY),
+        ItineraryPart(
+            sequence_index=1, query="coffee", named_place=False, category="cafe",
+            relation=Relation.NEAR, anchor_query="Den lille Havfrue",
+        ),
+    ])
+    results = execute_trip_specification(spec)
+    near_results = [r for r in results if r["relation"] == "near"]
+    assert len(near_results) >= 1
+    for r in near_results:
+        assert r["near_place"] == "Den lille Havfrue"
+        assert r["near_distance_km"] <= 2.0
+
+
+def test_sequential_then_coffee_never_calls_the_near_search(monkeypatch):
+    # The exact prior bug this whole redesign exists to prevent: a bare
+    # sequence word ("then") must never be reinterpreted as a spatial
+    # relationship. Re-verified here specifically alongside the query-
+    # aware near-search fix, to prove that fix didn't reopen this.
+    import agent.intent as intent_module
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("relation=sequential must never call _places_near")
+
+    monkeypatch.setattr(intent_module, "_places_near", _fail_if_called)
+
+    set_trip_start(None, None, "")
+    spec = TripSpecification(parts=[
+        ItineraryPart(sequence_index=0, query="Den lille Havfrue", named_place=True, relation=Relation.PRIMARY),
+        ItineraryPart(sequence_index=1, query="coffee", named_place=False, category="cafe", relation=Relation.SEQUENTIAL),
+    ])
+    results = execute_trip_specification(spec)
+    sequential_results = [r for r in results if r["relation"] == "sequential"]
+    assert len(sequential_results) > 0
+    for r in sequential_results:
         assert r["near_place"] is None
+        assert r["near_distance_km"] is None
+
+
+def test_far_coffee_far_away_never_calls_the_near_search(monkeypatch):
+    import agent.intent as intent_module
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("relation=far must never call _places_near")
+
+    monkeypatch.setattr(intent_module, "_places_near", _fail_if_called)
+
+    set_trip_start(55.6761, 12.5306, "Vanlose")
+    spec = TripSpecification(parts=[
+        ItineraryPart(sequence_index=0, query="Den lille Havfrue", named_place=True, relation=Relation.PRIMARY),
+        ItineraryPart(
+            sequence_index=1, query="coffee far away", named_place=False, category="cafe",
+            relation=Relation.FAR, anchor_query="Den lille Havfrue",
+        ),
+    ])
+    results = execute_trip_specification(spec)
+    far_results = [r for r in results if r["relation"] == "far"]
+    assert len(far_results) >= 1
+    for r in far_results:
+        assert r["near_place"] is None
+        assert r["near_distance_km"] is None
+
+
+def test_area_request_with_a_specific_cuisine_query_still_filters_by_neighborhood():
+    # relation=area never went through _places_near at all (it uses
+    # _search_places_rows, which already used the query correctly before
+    # this fix) - this locks in that it still does, unaffected.
+    set_trip_start(None, None, "")
+    spec = TripSpecification(parts=[
+        ItineraryPart(
+            sequence_index=0, query="vegetarian food", named_place=False, category="restaurant",
+            relation=Relation.AREA, neighborhood="Nørrebro",
+        ),
+    ])
+    results = execute_trip_specification(spec)
+    assert len(results) > 0
+    for r in results:
+        assert r["neighborhood"] == "Nørrebro"
+
+
+def test_near_search_with_no_relevant_match_triggers_serper_instead_of_a_generic_place(monkeypatch):
+    # The core safety requirement: if nothing genuinely relevant exists
+    # nearby, the system must not silently hand back "the closest
+    # restaurant" as if it satisfies the request - it must try Serper,
+    # same as any other insufficient-internal-results case. Real,
+    # verified-while-writing case: "vegan ethiopian food" near the Little
+    # Mermaid returns zero internal candidates after the relevance floor.
+    import agent.intent as intent_module
+
+    calls = {"n": 0}
+    real_fn = intent_module.discover_candidates_live
+
+    def spy(*a, **k):
+        calls["n"] += 1
+        return real_fn(*a, **k)
+
+    intent_module.discover_candidates_live = spy
+    try:
+        set_trip_start(None, None, "")
+        spec = TripSpecification(parts=[
+            ItineraryPart(sequence_index=0, query="Den lille Havfrue", named_place=True, relation=Relation.PRIMARY),
+            ItineraryPart(
+                sequence_index=1, query="vegan ethiopian food", named_place=False, category="restaurant",
+                relation=Relation.NEAR, anchor_query="Den lille Havfrue",
+            ),
+        ])
+        execute_trip_specification(spec)
+    finally:
+        intent_module.discover_candidates_live = real_fn
+
+    assert calls["n"] == 1
