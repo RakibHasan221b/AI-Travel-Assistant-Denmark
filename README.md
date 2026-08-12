@@ -75,7 +75,7 @@ honest fallback if it comes back empty.
 **Application layer.** FastAPI backend on Render, Next.js/React/TypeScript
 frontend on Vercel, calling the API directly from the browser.
 
-**Quality.** 136 automated tests, GitHub Actions CI, `ruff` linting.
+**Quality.** 144 automated tests, GitHub Actions CI, `ruff` linting.
 
 ## Key results
 
@@ -93,6 +93,7 @@ and using it surfaced real problems that got root-caused with evidence and
 fixed at the architecture level, not patched over:
 
 - **A real LLM reliability bug became a deterministic-routing redesign.** Live testing found that a bare sequence word like "then" (as in "...and then grab coffee") could get misread as a spatial-relationship marker, sending the agent searching "near" a place that was never meant as an anchor. Rather than patching the prompt again, spatial routing was moved out of the LLM entirely — a validated backend function now decides near/far/sequential/area deterministically, so the model reasons about intent and never about where to search.
+- **Even that deterministic "near" search had a real relevance bug.** Asking for "a sushi place near the Little Mermaid" silently returned the closest restaurant of any kind, Italian included, because `near` ranked candidates by distance alone and nothing ever read what was actually being asked for. Rather than hardcoding a cuisine list — which can never cover what a user might type next — the fix reused the same semantic-relevance ranking Explore already had: the traveler's own wording is now scored against every nearby candidate, and if genuinely nothing matches, the app says so honestly and falls back to a live search instead of quietly substituting something else. Verified with 8 new regression tests and real before/after checks against the live database.
 - **Four separate production failures, each root-caused to a specific line, not blamed on the framework.** Getting this live on a free-tier host surfaced a Python-version/build-sandbox mismatch, a missing transitive dependency only exposed by a narrower install, an out-of-memory kill traced to one specific import, and a CI dependency gap.
 - **A famous landmark returned zero search results, in production.** The Little Mermaid statue's only stored text was a bare Danish OSM tag — traced to rank 701 out of 1,896 in semantic search. Fixed with a web-enrichment pipeline; verified the fix moved it to rank 1.
 - **Every place in the database was missing its neighborhood.** `addr:suburb` is rarely set on individual OSM points. Fixed with real point-in-polygon matching against official Danish district boundaries (opendata.dk + DAWA) instead of a slow, rate-limited API — 99.9% matched in 36 seconds.
@@ -127,7 +128,7 @@ fixed at the architecture level, not patched over:
 | TypeScript | Frontend | Type safety across the frontend |
 | Tailwind CSS | Frontend | Styling |
 | Recharts | Frontend | Stats Dashboard charts |
-| pytest | Quality | 136 automated tests |
+| pytest | Quality | 144 automated tests |
 | ruff | Quality | Linting |
 | GitHub Actions | Quality | CI on every push |
 
